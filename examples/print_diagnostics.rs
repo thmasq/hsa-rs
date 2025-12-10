@@ -1,6 +1,6 @@
 use hsa_rs::kfd::device::KfdDevice;
 use hsa_rs::kfd::ioctl::{GetProcessAperturesNewArgs, ProcessDeviceApertures};
-use hsa_rs::kfd::topology::{
+use hsa_rs::kfd::sysfs::{
     HSA_IOLINKTYPE_NUMA, HSA_IOLINKTYPE_PCIEXPRESS, HSA_IOLINKTYPE_XGMI, Topology,
 };
 use std::fs::{self};
