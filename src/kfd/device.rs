@@ -1,4 +1,31 @@
-use crate::kfd::ioctl::*;
+use crate::kfd::ioctl::{
+    AMDKFD_IOC_ACQUIRE_VM, AMDKFD_IOC_AIS_OP, AMDKFD_IOC_ALLOC_MEMORY_OF_GPU,
+    AMDKFD_IOC_ALLOC_QUEUE_GWS, AMDKFD_IOC_AVAILABLE_MEMORY, AMDKFD_IOC_CREATE_EVENT,
+    AMDKFD_IOC_CREATE_QUEUE, AMDKFD_IOC_CRIU_OP, AMDKFD_IOC_CROSS_MEMORY_COPY,
+    AMDKFD_IOC_DBG_ADDRESS_WATCH_DEPRECATED, AMDKFD_IOC_DBG_REGISTER_DEPRECATED,
+    AMDKFD_IOC_DBG_TRAP, AMDKFD_IOC_DBG_UNREGISTER_DEPRECATED,
+    AMDKFD_IOC_DBG_WAVE_CONTROL_DEPRECATED, AMDKFD_IOC_DESTROY_EVENT, AMDKFD_IOC_DESTROY_QUEUE,
+    AMDKFD_IOC_EXPORT_DMABUF, AMDKFD_IOC_FREE_MEMORY_OF_GPU, AMDKFD_IOC_GET_CLOCK_COUNTERS,
+    AMDKFD_IOC_GET_DMABUF_INFO, AMDKFD_IOC_GET_PROCESS_APERTURES,
+    AMDKFD_IOC_GET_PROCESS_APERTURES_NEW, AMDKFD_IOC_GET_QUEUE_WAVE_STATE,
+    AMDKFD_IOC_GET_TILE_CONFIG, AMDKFD_IOC_GET_VERSION, AMDKFD_IOC_IMPORT_DMABUF,
+    AMDKFD_IOC_IPC_EXPORT_HANDLE, AMDKFD_IOC_IPC_IMPORT_HANDLE, AMDKFD_IOC_MAP_MEMORY_TO_GPU,
+    AMDKFD_IOC_PC_SAMPLE, AMDKFD_IOC_PROFILER, AMDKFD_IOC_RESET_EVENT, AMDKFD_IOC_RLC_SPM,
+    AMDKFD_IOC_RUNTIME_ENABLE, AMDKFD_IOC_SET_CU_MASK, AMDKFD_IOC_SET_EVENT,
+    AMDKFD_IOC_SET_MEMORY_POLICY, AMDKFD_IOC_SET_SCRATCH_BACKING_VA, AMDKFD_IOC_SET_TRAP_HANDLER,
+    AMDKFD_IOC_SET_XNACK_MODE, AMDKFD_IOC_SMI_EVENTS, AMDKFD_IOC_SVM,
+    AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, AMDKFD_IOC_UPDATE_QUEUE, AMDKFD_IOC_WAIT_EVENTS,
+    AcquireVmArgs, AisArgs, AllocMemoryOfGpuArgs, AllocQueueGwsArgs, CreateEventArgs,
+    CreateQueueArgs, CriuArgs, CrossMemoryCopyArgs, DbgAddressWatchArgs, DbgRegisterArgs,
+    DbgTrapArgs, DbgUnregisterArgs, DbgWaveControlArgs, DestroyEventArgs, DestroyQueueArgs,
+    ExportDmabufArgs, FreeMemoryOfGpuArgs, GetAvailableMemoryArgs, GetClockCountersArgs,
+    GetDmabufInfoArgs, GetProcessAperturesArgs, GetProcessAperturesNewArgs, GetQueueWaveStateArgs,
+    GetTileConfigArgs, GetVersionArgs, ImportDmabufArgs, IpcExportHandleArgs, IpcImportHandleArgs,
+    MapMemoryToGpuArgs, PcSampleArgs, ProfilerArgs, ResetEventArgs, RuntimeEnableArgs,
+    SetCuMaskArgs, SetEventArgs, SetMemoryPolicyArgs, SetScratchBackingVaArgs, SetTrapHandlerArgs,
+    SetXnackModeArgs, SmiEventsArgs, SpmArgs, SvmArgs, UnmapMemoryFromGpuArgs, UpdateQueueArgs,
+    WaitEventsArgs,
+};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;

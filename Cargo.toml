@@ -5,3 +5,7 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2.178"
+
+[[example]]
+name = "print_diagnostics"
+path = "examples/print_diagnostics.rs"

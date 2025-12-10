@@ -2,8 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::path::Path;
 
 const KFD_SYSFS_PATH: &str = "/sys/devices/virtual/kfd/kfd/topology";
 
@@ -1484,6 +1483,14 @@ pub struct Node {
 // ===============================================================================================
 
 impl Topology {
+    pub fn get_generation_id() -> io::Result<u32> {
+        let path = Path::new(KFD_SYSFS_PATH).join("generation_id");
+        let content = fs::read_to_string(path)?;
+        content.trim().parse::<u32>().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "Failed to parse generation_id")
+        })
+    }
+
     pub fn get_snapshot() -> io::Result<Self> {
         let root = Path::new(KFD_SYSFS_PATH);
         if !root.exists() {
