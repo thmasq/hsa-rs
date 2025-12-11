@@ -1,5 +1,6 @@
 #![allow(clippy::cast_possible_truncation)]
 
+use crate::error::{HsaError, HsaResult};
 use crate::kfd::device::KfdDevice;
 use crate::kfd::ioctl::{
     AMDKFD_IOC_CREATE_EVENT, AMDKFD_IOC_DESTROY_EVENT, AMDKFD_IOC_RESET_EVENT,
@@ -163,7 +164,8 @@ impl EventManager {
         desc: &HsaEventDescriptor,
         manual_reset: bool,
         is_signaled: bool,
-    ) -> Result<HsaEvent, i32> {
+    ) -> HsaResult<HsaEvent> {
+        // Changed return type
         let mut args = CreateEventArgs {
             event_type: desc.event_type as u32,
             node_id: desc.node_id,
@@ -180,9 +182,10 @@ impl EventManager {
             // This ensures CPU access (mapped) and Coherency.
             let events_alloc = memory_manager
                 .allocate_gtt(device, alloc_size, desc.node_id, drm_fd)
-                .inspect_err(|&e| {
+                .map_err(|e| -> HsaError {
                     eprintln!("Failed to allocate events page: {e:?}");
-                })?;
+                    e
+                })?; // Propagate HsaError from memory manager
 
             // Zero the memory
             if !events_alloc.ptr.is_null() {
@@ -201,7 +204,7 @@ impl EventManager {
         // 3. Call Create Event IOCTL
         if let Err(e) = unsafe { device.ioctl(AMDKFD_IOC_CREATE_EVENT, &mut args) } {
             eprintln!("AMDKFD_IOC_CREATE_EVENT failed: {e:?}");
-            return Err(-1);
+            return Err(HsaError::from(e));
         }
 
         // 4. Calculate HW Address
@@ -234,21 +237,17 @@ impl EventManager {
                 event_id: args.event_id,
                 pad: 0,
             };
-            if unsafe { device.ioctl(AMDKFD_IOC_SET_EVENT, &mut set_args) }.is_err() {
+            if let Err(e) = unsafe { device.ioctl(AMDKFD_IOC_SET_EVENT, &mut set_args) } {
                 // If setting the initial state fails, we must destroy the event to avoid leaking.
                 self.destroy_event(device, &event).ok();
-                return Err(-1);
+                return Err(HsaError::from(e));
             }
-            // Note: We do not manually increment `last_event_age` here because the
-            // kernel maintains the authoritative age. The next `wait` call will
-            // retrieve the updated age (1) from the kernel, see it matches 0 < 1,
-            // and correctly report the event as signaled.
         }
 
         Ok(event)
     }
 
-    pub fn destroy_event(&self, device: &KfdDevice, event: &HsaEvent) -> Result<(), i32> {
+    pub fn destroy_event(&self, device: &KfdDevice, event: &HsaEvent) -> HsaResult<()> {
         let mut args = DestroyEventArgs {
             event_id: event.event_id,
             pad: 0,
@@ -256,14 +255,16 @@ impl EventManager {
 
         if let Err(e) = unsafe { device.ioctl(AMDKFD_IOC_DESTROY_EVENT, &mut args) } {
             eprintln!("AMDKFD_IOC_DESTROY_EVENT failed: {e:?}");
-            return Err(-1);
+            return Err(HsaError::from(e));
         }
         Ok(())
     }
 
-    pub fn set_event(&self, device: &KfdDevice, event: &HsaEvent) -> Result<(), i32> {
+    pub fn set_event(&self, device: &KfdDevice, event: &HsaEvent) -> HsaResult<()> {
         if event.event_type.is_system_event() {
-            return Err(-1); // Cannot manually set system events
+            return Err(HsaError::General(
+                "Cannot manually set system event.".into(),
+            ));
         }
 
         let mut args = SetEventArgs {
@@ -271,15 +272,15 @@ impl EventManager {
             pad: 0,
         };
 
-        if unsafe { device.ioctl(AMDKFD_IOC_SET_EVENT, &mut args) }.is_err() {
-            return Err(-1);
-        }
+        unsafe { device.ioctl(AMDKFD_IOC_SET_EVENT, &mut args)? };
         Ok(())
     }
 
-    pub fn reset_event(&self, device: &KfdDevice, event: &HsaEvent) -> Result<(), i32> {
+    pub fn reset_event(&self, device: &KfdDevice, event: &HsaEvent) -> HsaResult<()> {
         if event.event_type.is_system_event() {
-            return Err(-1);
+            return Err(HsaError::General(
+                "Cannot manually reset system event.".into(),
+            ));
         }
 
         let mut args = ResetEventArgs {
@@ -287,9 +288,7 @@ impl EventManager {
             pad: 0,
         };
 
-        if unsafe { device.ioctl(AMDKFD_IOC_RESET_EVENT, &mut args) }.is_err() {
-            return Err(-1);
-        }
+        unsafe { device.ioctl(AMDKFD_IOC_RESET_EVENT, &mut args)? };
         Ok(())
     }
 
@@ -306,16 +305,17 @@ impl EventManager {
     ///   that were detected as signaled.
     ///   - This handles **Auto-Reset** events correctly by comparing event age.
     ///   - If `wait_all` is true, this will contain all valid indices.
-    /// * `Err(i32)`: Status code (e.g., -31 for Timeout).
+    /// * `Err(HsaError::WaitTimeout)`: If the timeout expires.
+    /// * `Err(HsaError::Io)`: If an underlying IOCTL fails.
     pub fn wait_on_multiple_events(
         &self,
         device: &KfdDevice,
         events: &mut [&mut HsaEvent],
         wait_all: bool,
         timeout_ms: u32,
-    ) -> Result<Vec<usize>, i32> {
+    ) -> HsaResult<Vec<usize>> {
         if events.is_empty() {
-            return Err(-1);
+            return Err(HsaError::General("No events to wait on.".into()));
         }
 
         // 1. Prepare input array for IOCTL
@@ -346,15 +346,10 @@ impl EventManager {
         };
 
         // 2. Call Wait IOCTL
-        // This blocks until the condition is met or timeout.
-        let ret = unsafe { device.ioctl(AMDKFD_IOC_WAIT_EVENTS, &mut args) };
-
-        if ret.is_err() {
-            return Err(-1);
-        }
+        unsafe { device.ioctl(AMDKFD_IOC_WAIT_EVENTS, &mut args)? };
 
         if args.wait_result == KFD_IOC_WAIT_RESULT_TIMEOUT {
-            return Err(-31); // HSAKMT_STATUS_WAIT_TIMEOUT
+            return Err(HsaError::WaitTimeout);
         }
 
         // 3. Process results and identify which events signaled

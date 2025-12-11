@@ -1,3 +1,4 @@
+use hsa_rs::error::HsaError;
 use hsa_rs::kfd::device::KfdDevice;
 use hsa_rs::kfd::ioctl::{GetProcessAperturesNewArgs, ProcessDeviceApertures};
 use hsa_rs::kfd::sysfs::HsaNodeProperties;
@@ -92,9 +93,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = event_manager.wait_on_multiple_events(&device, &mut events_to_wait, false, 500);
 
     match result {
-        Err(-31) => println!("    SUCCESS: Timed out as expected."),
+        Err(HsaError::WaitTimeout) => println!("    SUCCESS: Timed out as expected."),
         Ok(_) => panic!("    FAILURE: Event signaled unexpectedly!"),
-        Err(e) => panic!("    FAILURE: Unexpected error code: {}", e),
+        Err(e) => panic!("    FAILURE: Unexpected error: {}", e),
     }
 
     // 7. TEST 2: Signal and Wait

@@ -4,6 +4,7 @@
     clippy::cast_possible_wrap
 )]
 
+use crate::error::{HsaError, HsaResult};
 use crate::kfd::device::KfdDevice;
 use crate::kfd::ioctl::{
     AllocMemoryOfGpuArgs, GetProcessAperturesNewArgs, KFD_IOC_ALLOC_MEM_FLAGS_AQL_QUEUE_MEM,
@@ -193,7 +194,7 @@ pub struct MemoryManager {
 
 impl MemoryManager {
     /// Initialize the FMM context by querying KFD for process apertures.
-    pub fn new(device: &KfdDevice, nodes: &[HsaNodeProperties]) -> Result<Self, i32> {
+    pub fn new(device: &KfdDevice, nodes: &[HsaNodeProperties]) -> HsaResult<Self> {
         // 1. Build Node->GPU mapping
         let mut node_to_gpu_id = HashMap::new();
 
@@ -213,10 +214,7 @@ impl MemoryManager {
             pad: 0,
         };
 
-        if let Err(e) = device.get_process_apertures_new(&mut args) {
-            eprintln!("Failed to get process apertures: {e:?}");
-            return Err(-1);
-        }
+        device.get_process_apertures_new(&mut args)?;
 
         // 3. Process Aperture Info
         let mut gpu_apertures = HashMap::new();
@@ -320,7 +318,7 @@ impl MemoryManager {
         flags: AllocFlags,
         node_id: Option<u32>,
         drm_fd: RawFd,
-    ) -> Result<Allocation, i32> {
+    ) -> HsaResult<Allocation> {
         let size = if size == 0 { 4096 } else { size };
 
         // Default to the first GPU node if none specified
@@ -328,9 +326,21 @@ impl MemoryManager {
 
         // 1. Select Aperture
         let aperture = if flags.scratch {
-            &mut self.gpu_apertures.get_mut(&node_id).ok_or(-1)?.scratch
+            &mut self
+                .gpu_apertures
+                .get_mut(&node_id)
+                .ok_or_else(|| {
+                    HsaError::General(format!("No scratch aperture found for node {node_id}"))
+                })?
+                .scratch
         } else if flags.lds {
-            &mut self.gpu_apertures.get_mut(&node_id).ok_or(-1)?.lds
+            &mut self
+                .gpu_apertures
+                .get_mut(&node_id)
+                .ok_or_else(|| {
+                    HsaError::General(format!("No LDS aperture found for node {node_id}"))
+                })?
+                .lds
         } else if flags.coherent || flags.uncached || flags.doorbell {
             // Fine grain / Signals / Doorbells go to Alt aperture
             &mut self.svm_alt_aperture
@@ -340,7 +350,9 @@ impl MemoryManager {
         };
 
         // 2. Allocate Virtual Address (VA) from Aperture
-        let va_addr = aperture.allocate_va(size, align).ok_or(-12 /* ENOMEM */)?;
+        let va_addr = aperture
+            .allocate_va(size, align)
+            .ok_or(HsaError::OutOfMemory)?;
 
         // 3. Prepare IOCTL Flags
         let ioc_flags = flags.to_kfd_ioctl_flags();
@@ -356,10 +368,13 @@ impl MemoryManager {
             flags: ioc_flags,
         };
 
-        if let Err(e) = device.alloc_memory_of_gpu(&mut args) {
-            eprintln!("KFD Alloc Failed: {e:?}");
-            self.free_va_from_flags(va_addr, size, &flags, node_id);
-            return Err(-1);
+        match device.alloc_memory_of_gpu(&mut args) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("KFD Alloc Failed: {e:?}");
+                self.free_va_from_flags(va_addr, size, &flags, node_id);
+                return Err(HsaError::Io(e));
+            }
         }
 
         // 5. Map to GPU
@@ -370,10 +385,11 @@ impl MemoryManager {
             n_success: 0,
         };
 
-        if device.map_memory_to_gpu(&mut map_args).is_err() {
+        if let Err(e) = device.map_memory_to_gpu(&mut map_args) {
+            eprintln!("KFD Map Memory to GPU failed: {e:?}");
             device.free_memory_of_gpu(args.handle).ok();
             self.free_va_from_flags(va_addr, size, &flags, node_id);
-            return Err(-1);
+            return Err(HsaError::Io(e));
         }
 
         // 6. Map to CPU (mmap)
@@ -416,7 +432,7 @@ impl MemoryManager {
                     device.unmap_memory_from_gpu(&mut unmap_args).ok();
                     device.free_memory_of_gpu(args.handle).ok();
                     self.free_va_from_flags(va_addr, size, &flags, node_id);
-                    return Err(-1);
+                    return Err(HsaError::Io(std::io::Error::last_os_error()));
                 }
                 cpu_ptr = ret.cast::<u8>();
             }
@@ -444,7 +460,7 @@ impl MemoryManager {
         align: usize,
         node_id: u32,
         drm_fd: RawFd,
-    ) -> Result<Allocation, i32> {
+    ) -> HsaResult<Allocation> {
         let flags = AllocFlags::new().vram().executable().no_substitute();
 
         self.allocate(device, size, align, flags, Some(node_id), drm_fd)
@@ -457,7 +473,7 @@ impl MemoryManager {
         size: usize,
         node_id: u32,
         drm_fd: RawFd,
-    ) -> Result<Allocation, i32> {
+    ) -> HsaResult<Allocation> {
         let flags = AllocFlags::new().vram();
         self.allocate(device, size, 0, flags, Some(node_id), drm_fd)
     }
@@ -469,7 +485,7 @@ impl MemoryManager {
         size: usize,
         node_id: u32,
         drm_fd: RawFd,
-    ) -> Result<Allocation, i32> {
+    ) -> HsaResult<Allocation> {
         let flags = AllocFlags::new().gtt();
         self.allocate(device, size, 0, flags, Some(node_id), drm_fd)
     }
@@ -482,13 +498,16 @@ impl MemoryManager {
         gpu_id: u32,
         doorbell_offset: u64,
         size: u64,
-    ) -> Result<*mut u32, i32> {
+    ) -> HsaResult<*mut u32> {
         // Doorbell allocation is specialized, so we manually construct the flags here
         // or we could use the generic allocate with doorbell flags if we refactor deeper.
         // For now, keeping the optimized path but using the AllocFlags struct.
 
         let size = size as usize;
-        let va_addr = self.svm_alt_aperture.allocate_va(size, 4096).ok_or(-12)?;
+        let va_addr = self
+            .svm_alt_aperture
+            .allocate_va(size, 4096)
+            .ok_or(HsaError::OutOfMemory)?;
 
         let flags = KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL
             | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
@@ -507,7 +526,7 @@ impl MemoryManager {
         if let Err(e) = device.alloc_memory_of_gpu(&mut args) {
             eprintln!("[ERROR] map_doorbell: KFD Alloc failed: {e:?}");
             self.svm_alt_aperture.free_va(va_addr, size);
-            return Err(-1);
+            return Err(HsaError::from(e));
         }
 
         let cpu_ptr;
@@ -524,7 +543,7 @@ impl MemoryManager {
             if ret == libc::MAP_FAILED {
                 device.free_memory_of_gpu(args.handle).ok();
                 self.svm_alt_aperture.free_va(va_addr, size);
-                return Err(-1);
+                return Err(HsaError::General("mmap failed for doorbell".into()));
             }
             cpu_ptr = ret.cast::<u32>();
         }
@@ -605,7 +624,7 @@ impl BuilderMemoryManager for MemoryManager {
         vram: bool,
         public: bool,
         drm_fd: RawFd,
-    ) -> Result<Allocation, i32> {
+    ) -> HsaResult<Allocation> {
         let mut flags = AllocFlags::new();
         if vram {
             flags = flags.vram();
@@ -636,7 +655,7 @@ impl BuilderMemoryManager for MemoryManager {
         gpu_id: u32,
         doorbell_offset: u64,
         size: u64,
-    ) -> Result<*mut u32, i32> {
+    ) -> HsaResult<*mut u32> {
         self.map_doorbell(device, node_id, gpu_id, doorbell_offset, size)
     }
 }

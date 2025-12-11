@@ -1,5 +1,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
+use crate::error::{HsaError, HsaResult};
 use crate::kfd::device::KfdDevice;
 use crate::kfd::ioctl::{
     CreateQueueArgs, KFD_IOC_QUEUE_TYPE_COMPUTE, KFD_IOC_QUEUE_TYPE_COMPUTE_AQL,
@@ -87,7 +88,7 @@ pub trait MemoryManager {
         vram: bool,
         public: bool,
         drm_fd: RawFd,
-    ) -> Result<Allocation, i32>;
+    ) -> HsaResult<Allocation>;
 
     /// Free allocated memory
     fn free_gpu_memory(&mut self, device: &KfdDevice, alloc: &Allocation);
@@ -100,7 +101,7 @@ pub trait MemoryManager {
         gpu_id: u32,
         doorbell_offset: u64,
         size: u64,
-    ) -> Result<*mut u32, i32>;
+    ) -> HsaResult<*mut u32>;
 }
 
 pub struct QueueBuilder<'a> {
@@ -165,7 +166,7 @@ impl<'a> QueueBuilder<'a> {
     /// Panics if CWSR is allocated but the size calculation returns `None` during the IOCTL setup phase.
     /// This indicates an internal logic inconsistency where memory was allocated based on sizes,
     /// but the sizes are missing when needed later.
-    pub fn create(mut self) -> Result<HsaQueue, i32> {
+    pub fn create(mut self) -> HsaResult<HsaQueue> {
         let gfx_version = self.node_props.gfx_target_version;
         let is_compute = matches!(self.queue_type, QueueType::Compute | QueueType::ComputeAql);
 
@@ -224,10 +225,10 @@ impl<'a> QueueBuilder<'a> {
         }
 
         // 5. Call KFD CreateQueue IOCTL
-        self.device.create_queue(&mut args).map_err(|e| {
+        if let Err(e) = self.device.create_queue(&mut args) {
             eprintln!("KFD CreateQueue failed: {e:?}");
-            -1
-        })?;
+            return Err(HsaError::from(e));
+        }
 
         // 6. Map Doorbell
         // We do this after creation because we need the doorbell_offset returned by KFD.
@@ -251,7 +252,7 @@ impl<'a> QueueBuilder<'a> {
         })
     }
 
-    fn alloc_eop(&mut self, gfx_version: u32, is_compute: bool) -> Result<Option<Allocation>, i32> {
+    fn alloc_eop(&mut self, gfx_version: u32, is_compute: bool) -> HsaResult<Option<Allocation>> {
         let eop_size = Self::calculate_eop_size(gfx_version, is_compute);
         if eop_size > 0 {
             let mut alloc_res = self.mem_mgr.allocate_gpu_memory(
@@ -292,7 +293,7 @@ impl<'a> QueueBuilder<'a> {
         &mut self,
         gfx_version: u32,
         is_compute: bool,
-    ) -> Result<(Option<Allocation>, Option<cwsr::CwsrSizes>), i32> {
+    ) -> HsaResult<(Option<Allocation>, Option<cwsr::CwsrSizes>)> {
         if gfx_version >= 80000
             && is_compute
             && let Some(sizes) = cwsr::calculate_sizes(self.node_props)
@@ -328,12 +329,12 @@ impl<'a> QueueBuilder<'a> {
         Ok((None, None))
     }
 
-    fn alloc_pointers(&mut self) -> Result<Allocation, i32> {
+    fn alloc_pointers(&mut self) -> HsaResult<Allocation> {
         let ptr_alloc = self
             .mem_mgr
             .allocate_gpu_memory(self.device, 4096, 4096, false, true, self.drm_fd)
-            .inspect_err(|_e| {
-                eprintln!("Failed to allocate queue pointers");
+            .inspect_err(|e| {
+                eprintln!("Failed to allocate queue pointers: {e:?}");
             })?;
 
         unsafe {
@@ -378,7 +379,7 @@ impl<'a> QueueBuilder<'a> {
         &mut self,
         kernel_offset: u64,
         gfx_version: u32,
-    ) -> Result<*mut u32, i32> {
+    ) -> HsaResult<*mut u32> {
         let is_soc15 = gfx_version >= 90000;
 
         // Doorbell page size logic: SOC15+ uses 8 byte doorbells (conceptually), pre-SOC15 4KB.
