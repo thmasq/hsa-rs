@@ -24,7 +24,7 @@ const SVM_MIN_BASE: u64 = 0x1000_0000; // Start at 256MB
 const SVM_DEFAULT_ALIGN: usize = 4096;
 const SVM_GUARD_PAGES: usize = 1;
 
-/// Flags controlling memory allocation behavior (Maps to HsaMemFlags)
+/// Flags controlling memory allocation behavior (Maps to `HsaMemFlags`)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AllocFlags {
     pub vram: bool,
@@ -44,15 +44,18 @@ pub struct AllocFlags {
 }
 
 impl AllocFlags {
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[must_use] 
     pub fn vram(mut self) -> Self {
         self.vram = true;
         self
     }
 
+    #[must_use] 
     pub fn gtt(mut self) -> Self {
         self.gtt = true;
         self.host_access = true;
@@ -60,46 +63,55 @@ impl AllocFlags {
         self
     }
 
+    #[must_use] 
     pub fn doorbell(mut self) -> Self {
         self.doorbell = true;
         self
     }
 
+    #[must_use] 
     pub fn host_access(mut self) -> Self {
         self.host_access = true;
         self
     }
 
+    #[must_use] 
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
         self
     }
 
+    #[must_use] 
     pub fn executable(mut self) -> Self {
         self.execute_access = true;
         self
     }
 
+    #[must_use] 
     pub fn coherent(mut self) -> Self {
         self.coherent = true;
         self
     }
 
+    #[must_use] 
     pub fn uncached(mut self) -> Self {
         self.uncached = true;
         self
     }
 
+    #[must_use] 
     pub fn aql_queue_mem(mut self) -> Self {
         self.aql_queue_mem = true;
         self
     }
 
+    #[must_use] 
     pub fn no_substitute(mut self) -> Self {
         self.no_substitute = true;
         self
     }
 
+    #[must_use] 
     pub fn contiguous(mut self) -> Self {
         self.contiguous = true;
         self
@@ -150,7 +162,7 @@ impl MemoryManager {
         };
 
         if let Err(e) = device.get_process_apertures_new(&mut args) {
-            eprintln!("Failed to get process apertures: {:?}", e);
+            eprintln!("Failed to get process apertures: {e:?}");
             return Err(-1);
         }
 
@@ -158,7 +170,7 @@ impl MemoryManager {
         let mut gpu_apertures = HashMap::new();
         let mut max_gpuvm_limit = 0;
 
-        for aperture_info in apertures_vec.iter() {
+        for aperture_info in &apertures_vec {
             if aperture_info.gpu_id == 0 {
                 continue;
             }
@@ -332,7 +344,7 @@ impl MemoryManager {
         };
 
         if let Err(e) = device.alloc_memory_of_gpu(&mut args) {
-            eprintln!("KFD Alloc Failed: {:?}", e);
+            eprintln!("KFD Alloc Failed: {e:?}");
             self.free_va_from_flags(va_addr, size, &flags, node_id);
             return Err(-1);
         }
@@ -340,12 +352,12 @@ impl MemoryManager {
         // 5. Map to GPU
         let mut map_args = MapMemoryToGpuArgs {
             handle: args.handle,
-            device_ids_array_ptr: &gpu_id as *const _ as u64,
+            device_ids_array_ptr: &raw const gpu_id as u64,
             n_devices: 1,
             n_success: 0,
         };
 
-        if let Err(_) = device.map_memory_to_gpu(&mut map_args) {
+        if device.map_memory_to_gpu(&mut map_args).is_err() {
             device.free_memory_of_gpu(args.handle).ok();
             self.free_va_from_flags(va_addr, size, &flags, node_id);
             return Err(-1);
@@ -384,7 +396,7 @@ impl MemoryManager {
                     // Cleanup
                     let mut unmap_args = UnmapMemoryFromGpuArgs {
                         handle: args.handle,
-                        device_ids_array_ptr: &gpu_id as *const _ as u64,
+                        device_ids_array_ptr: &raw const gpu_id as u64,
                         n_devices: 1,
                         n_success: 0,
                     };
@@ -393,7 +405,7 @@ impl MemoryManager {
                     self.free_va_from_flags(va_addr, size, &flags, node_id);
                     return Err(-1);
                 }
-                cpu_ptr = ret as *mut u8;
+                cpu_ptr = ret.cast::<u8>();
             }
         }
 
@@ -480,7 +492,7 @@ impl MemoryManager {
         };
 
         if let Err(e) = device.alloc_memory_of_gpu(&mut args) {
-            eprintln!("[ERROR] map_doorbell: KFD Alloc failed: {:?}", e);
+            eprintln!("[ERROR] map_doorbell: KFD Alloc failed: {e:?}");
             self.svm_alt_aperture.free_va(va_addr, size);
             return Err(-1);
         }
@@ -501,11 +513,11 @@ impl MemoryManager {
                 self.svm_alt_aperture.free_va(va_addr, size);
                 return Err(-1);
             }
-            cpu_ptr = ret as *mut u32;
+            cpu_ptr = ret.cast::<u32>();
         }
 
         let alloc = Allocation {
-            ptr: cpu_ptr as *mut u8,
+            ptr: cpu_ptr.cast::<u8>(),
             size,
             gpu_va: va_addr,
             handle: args.handle,
@@ -523,7 +535,7 @@ impl MemoryManager {
             // 1. Munmap CPU
             if !alloc.ptr.is_null() {
                 unsafe {
-                    libc::munmap(alloc.ptr as *mut _, alloc.size);
+                    libc::munmap(alloc.ptr.cast(), alloc.size);
                 }
             }
 
@@ -539,17 +551,15 @@ impl MemoryManager {
                 && alloc.gpu_va < self.svm_alt_aperture.bounds().1
             {
                 self.svm_alt_aperture.free_va(alloc.gpu_va, alloc.size);
-            } else {
-                if let Some(gpu_aps) = self.gpu_apertures.get_mut(&alloc.node_id) {
-                    if alloc.gpu_va >= gpu_aps.scratch.bounds().0
-                        && alloc.gpu_va < gpu_aps.scratch.bounds().1
-                    {
-                        gpu_aps.scratch.free_va(alloc.gpu_va, alloc.size);
-                    } else if alloc.gpu_va >= gpu_aps.lds.bounds().0
-                        && alloc.gpu_va < gpu_aps.lds.bounds().1
-                    {
-                        gpu_aps.lds.free_va(alloc.gpu_va, alloc.size);
-                    }
+            } else if let Some(gpu_aps) = self.gpu_apertures.get_mut(&alloc.node_id) {
+                if alloc.gpu_va >= gpu_aps.scratch.bounds().0
+                    && alloc.gpu_va < gpu_aps.scratch.bounds().1
+                {
+                    gpu_aps.scratch.free_va(alloc.gpu_va, alloc.size);
+                } else if alloc.gpu_va >= gpu_aps.lds.bounds().0
+                    && alloc.gpu_va < gpu_aps.lds.bounds().1
+                {
+                    gpu_aps.lds.free_va(alloc.gpu_va, alloc.size);
                 }
             }
         }

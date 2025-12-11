@@ -16,6 +16,7 @@ pub struct Aperture {
 }
 
 impl Aperture {
+    #[must_use] 
     pub fn new(base: u64, limit: u64, align: u64, guard_pages: u64) -> Self {
         Self {
             base,
@@ -74,15 +75,14 @@ impl ApertureAllocator for Aperture {
         None // Out of virtual address space
     }
 
-    fn free_va(&mut self, addr: u64, size: usize) {
+    fn free_va(&mut self, addr: u64, _size: usize) {
         let guard_size = self.guard_pages * 4096;
         // The tracked start is the address MINUS the guard page we added
         let tracked_start = addr - guard_size;
 
         if self.allocations.remove(&tracked_start).is_none() {
             eprintln!(
-                "FMM Error: Tried to free VA 0x{:x} which was not tracked",
-                addr
+                "FMM Error: Tried to free VA 0x{addr:x} which was not tracked"
             );
         }
     }

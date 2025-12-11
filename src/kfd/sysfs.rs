@@ -1356,8 +1356,8 @@ fn lookup_marketing_name_from_file(device_id: u32, revision_id: u32) -> Option<S
                 let file_rid_str = parts[1].trim();
                 let product_name = parts[2].trim().to_string();
 
-                if let Ok(file_did) = u32::from_str_radix(file_did_str, 16) {
-                    if file_did == device_id {
+                if let Ok(file_did) = u32::from_str_radix(file_did_str, 16)
+                    && file_did == device_id {
                         // Check Revision:
                         // Some entries might use wildcards or specific revisions.
                         // Ideally we match the exact revision if possible.
@@ -1374,7 +1374,6 @@ fn lookup_marketing_name_from_file(device_id: u32, revision_id: u32) -> Option<S
                             // but modern amdgpu.ids is strictly hex.
                         }
                     }
-                }
             }
         }
     }
@@ -1390,8 +1389,7 @@ fn get_pci_revision_id(domain: u32, location_id: u32) -> Option<u32> {
     let func = location_id & 0x07;
 
     let pci_path = format!(
-        "/sys/bus/pci/devices/{:04x}:{:02x}:{:02x}.{:01x}/revision",
-        domain, bus, dev, func
+        "/sys/bus/pci/devices/{domain:04x}:{bus:02x}:{dev:02x}.{func:01x}/revision"
     );
 
     if let Ok(content) = fs::read_to_string(&pci_path) {
@@ -1577,7 +1575,7 @@ impl Topology {
         let nodes_dir = root.join("nodes");
 
         if let Ok(entries) = fs::read_dir(nodes_dir) {
-            let mut paths: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+            let mut paths: Vec<_> = entries.filter_map(std::result::Result::ok).map(|e| e.path()).collect();
             // Sort by integer node ID to match sysfs order
             paths.sort_by_key(|p| {
                 p.file_name()
@@ -1587,8 +1585,8 @@ impl Topology {
             });
 
             for (idx, path) in paths.iter().enumerate() {
-                if path.is_dir() {
-                    if let Ok(mut node) = Node::from_sysfs(path) {
+                if path.is_dir()
+                    && let Ok(mut node) = Node::from_sysfs(path) {
                         node.properties.node_id = idx as u32;
 
                         // Enrich CPU nodes with model name
@@ -1606,7 +1604,6 @@ impl Topology {
 
                         nodes.push(node);
                     }
-                }
             }
         }
 
@@ -1660,8 +1657,8 @@ impl Topology {
 
         if let Ok(val) = override_val {
             let parts: Vec<&str> = val.split('.').collect();
-            if parts.len() == 3 {
-                if let (Ok(maj), Ok(min), Ok(stp)) = (
+            if parts.len() == 3
+                && let (Ok(maj), Ok(min), Ok(stp)) = (
                     parts[0].parse::<u32>(),
                     parts[1].parse::<u32>(),
                     parts[2].parse::<u32>(),
@@ -1671,7 +1668,6 @@ impl Topology {
                     minor = min;
                     step = stp;
                 }
-            }
         }
 
         // 3. Update Engine ID
@@ -1686,9 +1682,9 @@ impl Topology {
         if let Some(entry) = find_gfx_ip(props.device_id as u16, major as u8) {
             props.amd_name = entry.name.to_string();
             // If table has stricter versioning, update EngineID
-            props.engine_id.major = entry.major as u32;
-            props.engine_id.minor = entry.minor as u32;
-            props.engine_id.stepping = entry.stepping as u32;
+            props.engine_id.major = u32::from(entry.major);
+            props.engine_id.minor = u32::from(entry.minor);
+            props.engine_id.stepping = u32::from(entry.stepping);
         } else {
             // Default AMD Name
             props.amd_name = format!("GFX{:02x}", props.gfx_target_version);
@@ -1877,8 +1873,8 @@ impl Topology {
         let mut p = HsaSystemProperties::default();
         for line in content.lines() {
             let mut parts = line.split_whitespace();
-            if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                if let Ok(val) = v.parse::<u32>() {
+            if let (Some(k), Some(v)) = (parts.next(), parts.next())
+                && let Ok(val) = v.parse::<u32>() {
                     match k {
                         "platform_oem" => p.platform_oem = val,
                         "platform_id" => p.platform_id = val,
@@ -1886,7 +1882,6 @@ impl Topology {
                         _ => {}
                     }
                 }
-            }
         }
         Ok(p)
     }
@@ -1901,13 +1896,11 @@ impl Node {
         let mut properties = Self::parse_node_properties(&path.join("properties"))?;
 
         // Fallback for GPU ID
-        if properties.kfd_gpu_id == 0 {
-            if let Ok(txt) = fs::read_to_string(path.join("gpu_id")) {
-                if let Ok(val) = txt.trim().parse::<u32>() {
+        if properties.kfd_gpu_id == 0
+            && let Ok(txt) = fs::read_to_string(path.join("gpu_id"))
+                && let Ok(val) = txt.trim().parse::<u32>() {
                     properties.kfd_gpu_id = val;
                 }
-            }
-        }
 
         let mem_banks =
             Self::parse_sub_objects(&path.join("mem_banks"), Self::parse_memory_properties)?;
@@ -1992,8 +1985,8 @@ impl Node {
         let mut p = HsaMemoryProperties::default();
         for line in content.lines() {
             let mut parts = line.split_whitespace();
-            if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                if let Ok(val) = v.parse::<u64>() {
+            if let (Some(k), Some(v)) = (parts.next(), parts.next())
+                && let Ok(val) = v.parse::<u64>() {
                     match k {
                         "heap_type" => p.heap_type = val as u32,
                         "size_in_bytes" => p.size_in_bytes = val,
@@ -2003,7 +1996,6 @@ impl Node {
                         _ => {}
                     }
                 }
-            }
         }
         Ok(p)
     }
@@ -2023,8 +2015,8 @@ impl Node {
                 }
                 continue;
             }
-            if let (Some(k), Some(v)) = (key, parts.next()) {
-                if let Ok(val) = v.parse::<u32>() {
+            if let (Some(k), Some(v)) = (key, parts.next())
+                && let Ok(val) = v.parse::<u32>() {
                     match k {
                         "processor_id_low" => p.processor_id_low = val,
                         "level" => p.cache_level = val,
@@ -2037,7 +2029,6 @@ impl Node {
                         _ => {}
                     }
                 }
-            }
         }
         Ok(p)
     }
@@ -2047,8 +2038,8 @@ impl Node {
         let mut p = HsaIoLinkProperties::default();
         for line in content.lines() {
             let mut parts = line.split_whitespace();
-            if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                if let Ok(val) = v.parse::<u32>() {
+            if let (Some(k), Some(v)) = (parts.next(), parts.next())
+                && let Ok(val) = v.parse::<u32>() {
                     match k {
                         "type" => p.type_ = val,
                         "version_major" => p.version_major = val,
@@ -2066,7 +2057,6 @@ impl Node {
                         _ => {}
                     }
                 }
-            }
         }
         Ok(p)
     }
@@ -2080,7 +2070,7 @@ impl Node {
             return Ok(results);
         }
         if let Ok(entries) = fs::read_dir(dir) {
-            let mut paths: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+            let mut paths: Vec<_> = entries.filter_map(std::result::Result::ok).map(|e| e.path()).collect();
             paths.sort_by_key(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
@@ -2093,11 +2083,9 @@ impl Node {
                     .and_then(|n| n.to_str())
                     .and_then(|s| s.parse::<u32>().ok())
                     .is_some()
-                {
-                    if let Ok(obj) = parse_func(&path) {
+                    && let Ok(obj) = parse_func(&path) {
                         results.push(obj);
                     }
-                }
             }
         }
         Ok(results)

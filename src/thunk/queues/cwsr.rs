@@ -36,7 +36,14 @@ pub struct CwsrSizes {
     pub total_mem_alloc_size: u32,
 }
 
+impl Default for HsaUserContextSaveAreaHeader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HsaUserContextSaveAreaHeader {
+    #[must_use] 
     pub fn new() -> Self {
         // Initialize with zeros; callers will populate specific fields
         // Note: offsets/sizes are 0 here and filled by `init_header`
@@ -97,6 +104,7 @@ fn cntl_stack_bytes_per_wave(gfx_version: u32) -> u32 {
 }
 
 /// Calculates the required CWSR sizes based on Node Properties.
+#[must_use] 
 pub fn calculate_sizes(props: &HsaNodeProperties) -> Option<CwsrSizes> {
     // Pre-Carrizo/GFX8 not supported in this path
     if props.gfx_target_version < 80000 {
@@ -188,7 +196,7 @@ pub unsafe fn init_header(
 
     for i in 0..num_xcc {
         let offset = i * sizes.ctx_save_restore_size;
-        let header_ptr = unsafe { ptr.add(offset as usize) } as *mut HsaUserContextSaveAreaHeader;
+        let header_ptr = unsafe { ptr.add(offset as usize) }.cast::<HsaUserContextSaveAreaHeader>();
 
         let mut header = HsaUserContextSaveAreaHeader::new();
 

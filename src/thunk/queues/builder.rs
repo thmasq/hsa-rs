@@ -142,11 +142,13 @@ impl<'a> QueueBuilder<'a> {
         }
     }
 
+    #[must_use] 
     pub fn with_type(mut self, t: QueueType) -> Self {
         self.queue_type = t;
         self
     }
 
+    #[must_use] 
     pub fn with_priority(mut self, p: QueuePriority) -> Self {
         self.priority = p;
         self
@@ -182,9 +184,8 @@ impl<'a> QueueBuilder<'a> {
                 );
             }
 
-            let alloc = alloc_res.map_err(|e| {
+            let alloc = alloc_res.inspect_err(|_e| {
                 eprintln!("Failed to allocate EOP buffer");
-                e
             })?;
 
             unsafe {
@@ -198,8 +199,8 @@ impl<'a> QueueBuilder<'a> {
         let mut cwsr_mem = None;
         let mut cwsr_sizes = None;
 
-        if gfx_version >= 80000 && is_compute {
-            if let Some(sizes) = cwsr::calculate_sizes(self.node_props) {
+        if gfx_version >= 80000 && is_compute
+            && let Some(sizes) = cwsr::calculate_sizes(self.node_props) {
                 // CWSR prefers GTT (Host Allocated) so CPU can write the header easily.
                 let alloc = self
                     .mem_mgr
@@ -211,9 +212,8 @@ impl<'a> QueueBuilder<'a> {
                         false,
                         self.drm_fd,
                     )
-                    .map_err(|e| {
+                    .inspect_err(|_e| {
                         eprintln!("Failed to allocate CWSR");
-                        e
                     })?;
 
                 // Initialize Header
@@ -230,16 +230,14 @@ impl<'a> QueueBuilder<'a> {
                 cwsr_sizes = Some(sizes);
                 cwsr_mem = Some(alloc);
             }
-        }
 
         // 3. Allocate Queue Read/Write Pointers (if needed)
         // These are small 64-bit counters usually placed in a 4K page.
         let ptr_alloc = self
             .mem_mgr
             .allocate_gpu_memory(self.device, 4096, 4096, false, true, self.drm_fd)
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 eprintln!("Failed to allocate queue pointers");
-                e
             })?;
 
         unsafe {
@@ -288,7 +286,7 @@ impl<'a> QueueBuilder<'a> {
 
         // 5. Call KFD CreateQueue IOCTL
         self.device.create_queue(&mut args).map_err(|e| {
-            eprintln!("KFD CreateQueue failed: {:?}", e);
+            eprintln!("KFD CreateQueue failed: {e:?}");
             -1
         })?;
 
@@ -376,8 +374,8 @@ impl<'a> QueueBuilder<'a> {
 
         unsafe {
             // base_ptr is the start of the page. Add the offset to get the specific queue doorbell.
-            let byte_ptr = (base_ptr as *mut u8).add(ptr_offset as usize);
-            Ok(byte_ptr as *mut u32)
+            let byte_ptr = base_ptr.cast::<u8>().add(ptr_offset as usize);
+            Ok(byte_ptr.cast::<u32>())
         }
     }
 }

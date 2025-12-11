@@ -60,7 +60,7 @@ impl KfdDevice {
     /// # Safety
     /// The caller must ensure that `arg` points to valid memory appropriate for the specific `cmd`.
     pub unsafe fn ioctl<T>(&self, cmd: u32, arg: &mut T) -> io::Result<()> {
-        let ret = unsafe { libc::ioctl(self.file.as_raw_fd(), cmd as _, arg as *mut T) };
+        let ret = unsafe { libc::ioctl(self.file.as_raw_fd(), cmd.into(), std::ptr::from_mut::<T>(arg)) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -121,7 +121,7 @@ impl KfdDevice {
     ///
     /// This is a critical step to link the KFD process context with the AMDGPU DRM context.
     pub fn acquire_vm(&self, gpu_id: u32, drm_fd: u32) -> io::Result<()> {
-        let mut args = AcquireVmArgs { gpu_id, drm_fd };
+        let mut args = AcquireVmArgs { drm_fd, gpu_id };
         unsafe { self.ioctl(AMDKFD_IOC_ACQUIRE_VM, &mut args) }
     }
 
@@ -308,7 +308,7 @@ impl KfdDevice {
     /// Configure XNACK mode (retry on page fault).
     pub fn set_xnack_mode(&self, xnack_enabled: bool) -> io::Result<()> {
         let mut args = SetXnackModeArgs {
-            xnack_enabled: if xnack_enabled { 1 } else { 0 },
+            xnack_enabled: i32::from(xnack_enabled),
         };
         unsafe { self.ioctl(AMDKFD_IOC_SET_XNACK_MODE, &mut args) }
     }
