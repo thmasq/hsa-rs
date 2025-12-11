@@ -175,7 +175,7 @@ impl AllocFlags {
 struct GpuApertures {
     lds: Aperture,
     scratch: Aperture,
-    gpuvm: Aperture, // Canonical or Non-Canonical GPUVM aperture
+    _gpuvm: Aperture, // Canonical or Non-Canonical GPUVM aperture
 }
 
 pub struct MemoryManager {
@@ -261,7 +261,7 @@ impl MemoryManager {
                 GpuApertures {
                     lds,
                     scratch,
-                    gpuvm,
+                    _gpuvm: gpuvm,
                 },
             );
         }
