@@ -59,7 +59,7 @@ impl KfdDevice {
     ///
     /// # Safety
     /// The caller must ensure that `arg` points to valid memory appropriate for the specific `cmd`.
-    unsafe fn ioctl<T>(&self, cmd: u32, arg: &mut T) -> io::Result<()> {
+    pub unsafe fn ioctl<T>(&self, cmd: u32, arg: &mut T) -> io::Result<()> {
         let ret = unsafe { libc::ioctl(self.file.as_raw_fd(), cmd as _, arg as *mut T) };
         if ret < 0 {
             return Err(io::Error::last_os_error());

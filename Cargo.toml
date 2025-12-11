@@ -14,3 +14,6 @@ path = "examples/print_diagnostics.rs"
 name = "queue_create"
 path = "examples/queue_create.rs"
 
+[[example]]
+name = "event_test"
+path = "examples/event_test.rs"
