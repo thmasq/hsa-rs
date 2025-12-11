@@ -813,14 +813,14 @@ pub struct CrossMemoryCopyArgs {
 // SVM (Shared Virtual Memory)
 // ===============================================================================================
 
-pub const KFD_IOCTL_SVM_FLAG_HOST_ACCESS: u32 = 0x00000001;
-pub const KFD_IOCTL_SVM_FLAG_COHERENT: u32 = 0x00000002;
-pub const KFD_IOCTL_SVM_FLAG_HIVE_LOCAL: u32 = 0x00000004;
-pub const KFD_IOCTL_SVM_FLAG_GPU_RO: u32 = 0x00000008;
-pub const KFD_IOCTL_SVM_FLAG_GPU_EXEC: u32 = 0x00000010;
-pub const KFD_IOCTL_SVM_FLAG_GPU_READ_MOSTLY: u32 = 0x00000020;
-pub const KFD_IOCTL_SVM_FLAG_GPU_ALWAYS_MAPPED: u32 = 0x00000040;
-pub const KFD_IOCTL_SVM_FLAG_EXT_COHERENT: u32 = 0x00000080;
+pub const KFD_IOCTL_SVM_FLAG_HOST_ACCESS: u32 = 0x0000_0001;
+pub const KFD_IOCTL_SVM_FLAG_COHERENT: u32 = 0x0000_0002;
+pub const KFD_IOCTL_SVM_FLAG_HIVE_LOCAL: u32 = 0x0000_0004;
+pub const KFD_IOCTL_SVM_FLAG_GPU_RO: u32 = 0x0000_0008;
+pub const KFD_IOCTL_SVM_FLAG_GPU_EXEC: u32 = 0x0000_0010;
+pub const KFD_IOCTL_SVM_FLAG_GPU_READ_MOSTLY: u32 = 0x0000_0020;
+pub const KFD_IOCTL_SVM_FLAG_GPU_ALWAYS_MAPPED: u32 = 0x0000_0040;
+pub const KFD_IOCTL_SVM_FLAG_EXT_COHERENT: u32 = 0x0000_0080;
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]

@@ -1,3 +1,9 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::kfd::device::KfdDevice;
 use crate::kfd::ioctl::{
     AllocMemoryOfGpuArgs, GetProcessAperturesNewArgs, KFD_IOC_ALLOC_MEM_FLAGS_AQL_QUEUE_MEM,
@@ -44,75 +50,75 @@ pub struct AllocFlags {
 }
 
 impl AllocFlags {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    #[must_use] 
-    pub fn vram(mut self) -> Self {
+    #[must_use]
+    pub const fn vram(mut self) -> Self {
         self.vram = true;
         self
     }
 
-    #[must_use] 
-    pub fn gtt(mut self) -> Self {
+    #[must_use]
+    pub const fn gtt(mut self) -> Self {
         self.gtt = true;
         self.host_access = true;
         self.coherent = true;
         self
     }
 
-    #[must_use] 
-    pub fn doorbell(mut self) -> Self {
+    #[must_use]
+    pub const fn doorbell(mut self) -> Self {
         self.doorbell = true;
         self
     }
 
-    #[must_use] 
-    pub fn host_access(mut self) -> Self {
+    #[must_use]
+    pub const fn host_access(mut self) -> Self {
         self.host_access = true;
         self
     }
 
-    #[must_use] 
-    pub fn read_only(mut self) -> Self {
+    #[must_use]
+    pub const fn read_only(mut self) -> Self {
         self.read_only = true;
         self
     }
 
-    #[must_use] 
-    pub fn executable(mut self) -> Self {
+    #[must_use]
+    pub const fn executable(mut self) -> Self {
         self.execute_access = true;
         self
     }
 
-    #[must_use] 
-    pub fn coherent(mut self) -> Self {
+    #[must_use]
+    pub const fn coherent(mut self) -> Self {
         self.coherent = true;
         self
     }
 
-    #[must_use] 
-    pub fn uncached(mut self) -> Self {
+    #[must_use]
+    pub const fn uncached(mut self) -> Self {
         self.uncached = true;
         self
     }
 
-    #[must_use] 
-    pub fn aql_queue_mem(mut self) -> Self {
+    #[must_use]
+    pub const fn aql_queue_mem(mut self) -> Self {
         self.aql_queue_mem = true;
         self
     }
 
-    #[must_use] 
-    pub fn no_substitute(mut self) -> Self {
+    #[must_use]
+    pub const fn no_substitute(mut self) -> Self {
         self.no_substitute = true;
         self
     }
 
-    #[must_use] 
-    pub fn contiguous(mut self) -> Self {
+    #[must_use]
+    pub const fn contiguous(mut self) -> Self {
         self.contiguous = true;
         self
     }

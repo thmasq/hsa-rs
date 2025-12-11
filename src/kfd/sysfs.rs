@@ -1,3 +1,9 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::similar_names
+)]
+
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
@@ -750,7 +756,7 @@ const GFXIP_LOOKUP_TABLE: &[GfxIpLookup] = &[
         name: "Vega12",
     },
     GfxIpLookup {
-        device_id: 0x69Af,
+        device_id: 0x69AF,
         major: 9,
         minor: 0,
         stepping: 4,
@@ -1357,23 +1363,24 @@ fn lookup_marketing_name_from_file(device_id: u32, revision_id: u32) -> Option<S
                 let product_name = parts[2].trim().to_string();
 
                 if let Ok(file_did) = u32::from_str_radix(file_did_str, 16)
-                    && file_did == device_id {
-                        // Check Revision:
-                        // Some entries might use wildcards or specific revisions.
-                        // Ideally we match the exact revision if possible.
-                        // However, the file format is strictly "device, rev, name".
+                    && file_did == device_id
+                {
+                    // Check Revision:
+                    // Some entries might use wildcards or specific revisions.
+                    // Ideally we match the exact revision if possible.
+                    // However, the file format is strictly "device, rev, name".
 
-                        // If rev is not a valid hex, ignore this line (e.g. version header "1.0.0")
-                        if let Ok(file_rid) = u32::from_str_radix(file_rid_str, 16) {
-                            if file_rid == revision_id {
-                                return Some(product_name);
-                            }
-                        } else {
-                            // If revision parses as non-hex (unlikely in valid lines), ignore.
-                            // Note: Some legacy formats might have different rules,
-                            // but modern amdgpu.ids is strictly hex.
+                    // If rev is not a valid hex, ignore this line (e.g. version header "1.0.0")
+                    if let Ok(file_rid) = u32::from_str_radix(file_rid_str, 16) {
+                        if file_rid == revision_id {
+                            return Some(product_name);
                         }
+                    } else {
+                        // If revision parses as non-hex (unlikely in valid lines), ignore.
+                        // Note: Some legacy formats might have different rules,
+                        // but modern amdgpu.ids is strictly hex.
                     }
+                }
             }
         }
     }
@@ -1388,9 +1395,8 @@ fn get_pci_revision_id(domain: u32, location_id: u32) -> Option<u32> {
     let dev = (location_id >> 3) & 0x1F;
     let func = location_id & 0x07;
 
-    let pci_path = format!(
-        "/sys/bus/pci/devices/{domain:04x}:{bus:02x}:{dev:02x}.{func:01x}/revision"
-    );
+    let pci_path =
+        format!("/sys/bus/pci/devices/{domain:04x}:{bus:02x}:{dev:02x}.{func:01x}/revision");
 
     if let Ok(content) = fs::read_to_string(&pci_path) {
         let content = content.trim();
@@ -1403,9 +1409,13 @@ fn get_pci_revision_id(domain: u32, location_id: u32) -> Option<u32> {
 }
 
 // Logic to emulate hsakmt_get_vgpr_size_per_cu based on GFX version
-fn get_vgpr_size_per_cu(major: u32, minor: u32, stepping: u32) -> u32 {
+const fn get_vgpr_size_per_cu(major: u32, minor: u32, stepping: u32) -> u32 {
     let full = (major << 16) | (minor << 8) | stepping;
-    if full >= 0x0A0000 { 262144 } else { 262144 }
+    if full >= 0x000A_0000 {
+        262_144
+    } else {
+        262_144
+    }
 }
 
 // ===============================================================================================
@@ -1575,7 +1585,10 @@ impl Topology {
         let nodes_dir = root.join("nodes");
 
         if let Ok(entries) = fs::read_dir(nodes_dir) {
-            let mut paths: Vec<_> = entries.filter_map(std::result::Result::ok).map(|e| e.path()).collect();
+            let mut paths: Vec<_> = entries
+                .filter_map(std::result::Result::ok)
+                .map(|e| e.path())
+                .collect();
             // Sort by integer node ID to match sysfs order
             paths.sort_by_key(|p| {
                 p.file_name()
@@ -1586,24 +1599,25 @@ impl Topology {
 
             for (idx, path) in paths.iter().enumerate() {
                 if path.is_dir()
-                    && let Ok(mut node) = Node::from_sysfs(path) {
-                        node.properties.node_id = idx as u32;
+                    && let Ok(mut node) = Node::from_sysfs(path)
+                {
+                    node.properties.node_id = idx as u32;
 
-                        // Enrich CPU nodes with model name
-                        if node.properties.cpu_cores_count > 0 {
-                            if let Some(info) = cpu_info.get(&node.properties.cpu_core_id_base) {
-                                node.properties.marketing_name = info.clone();
-                                node.properties.amd_name = info.clone();
-                            } else {
-                                node.properties.marketing_name = "AMD CPU".to_string();
-                            }
+                    // Enrich CPU nodes with model name
+                    if node.properties.cpu_cores_count > 0 {
+                        if let Some(info) = cpu_info.get(&node.properties.cpu_core_id_base) {
+                            node.properties.marketing_name.clone_from(info);
+                            node.properties.amd_name.clone_from(info);
+                        } else {
+                            node.properties.marketing_name = "AMD CPU".to_string();
                         }
-
-                        // Enrich GPU nodes (Overrides, Lookups, Derived Props)
-                        Self::enrich_gpu_properties(&mut node.properties);
-
-                        nodes.push(node);
                     }
+
+                    // Enrich GPU nodes (Overrides, Lookups, Derived Props)
+                    Self::enrich_gpu_properties(&mut node.properties);
+
+                    nodes.push(node);
+                }
             }
         }
 
@@ -1662,12 +1676,13 @@ impl Topology {
                     parts[0].parse::<u32>(),
                     parts[1].parse::<u32>(),
                     parts[2].parse::<u32>(),
-                ) {
-                    // Valid override found, update local vars
-                    major = maj;
-                    minor = min;
-                    step = stp;
-                }
+                )
+            {
+                // Valid override found, update local vars
+                major = maj;
+                minor = min;
+                step = stp;
+            }
         }
 
         // 3. Update Engine ID
@@ -1874,14 +1889,15 @@ impl Topology {
         for line in content.lines() {
             let mut parts = line.split_whitespace();
             if let (Some(k), Some(v)) = (parts.next(), parts.next())
-                && let Ok(val) = v.parse::<u32>() {
-                    match k {
-                        "platform_oem" => p.platform_oem = val,
-                        "platform_id" => p.platform_id = val,
-                        "platform_rev" => p.platform_rev = val,
-                        _ => {}
-                    }
+                && let Ok(val) = v.parse::<u32>()
+            {
+                match k {
+                    "platform_oem" => p.platform_oem = val,
+                    "platform_id" => p.platform_id = val,
+                    "platform_rev" => p.platform_rev = val,
+                    _ => {}
                 }
+            }
         }
         Ok(p)
     }
@@ -1898,17 +1914,18 @@ impl Node {
         // Fallback for GPU ID
         if properties.kfd_gpu_id == 0
             && let Ok(txt) = fs::read_to_string(path.join("gpu_id"))
-                && let Ok(val) = txt.trim().parse::<u32>() {
-                    properties.kfd_gpu_id = val;
-                }
+            && let Ok(val) = txt.trim().parse::<u32>()
+        {
+            properties.kfd_gpu_id = val;
+        }
 
         let mem_banks =
-            Self::parse_sub_objects(&path.join("mem_banks"), Self::parse_memory_properties)?;
-        let caches = Self::parse_sub_objects(&path.join("caches"), Self::parse_cache_properties)?;
+            Self::parse_sub_objects(&path.join("mem_banks"), Self::parse_memory_properties);
+        let caches = Self::parse_sub_objects(&path.join("caches"), Self::parse_cache_properties);
         let mut io_links =
-            Self::parse_sub_objects(&path.join("io_links"), Self::parse_iolink_properties)?;
+            Self::parse_sub_objects(&path.join("io_links"), Self::parse_iolink_properties);
         let mut p2p_links =
-            Self::parse_sub_objects(&path.join("p2p_links"), Self::parse_iolink_properties)?;
+            Self::parse_sub_objects(&path.join("p2p_links"), Self::parse_iolink_properties);
         io_links.append(&mut p2p_links);
 
         Ok(Self {
@@ -1986,16 +2003,17 @@ impl Node {
         for line in content.lines() {
             let mut parts = line.split_whitespace();
             if let (Some(k), Some(v)) = (parts.next(), parts.next())
-                && let Ok(val) = v.parse::<u64>() {
-                    match k {
-                        "heap_type" => p.heap_type = val as u32,
-                        "size_in_bytes" => p.size_in_bytes = val,
-                        "flags" => p.flags = val as u32,
-                        "width" => p.width = val as u32,
-                        "mem_clk_max" => p.mem_clk_max = val as u32,
-                        _ => {}
-                    }
+                && let Ok(val) = v.parse::<u64>()
+            {
+                match k {
+                    "heap_type" => p.heap_type = val as u32,
+                    "size_in_bytes" => p.size_in_bytes = val,
+                    "flags" => p.flags = val as u32,
+                    "width" => p.width = val as u32,
+                    "mem_clk_max" => p.mem_clk_max = val as u32,
+                    _ => {}
                 }
+            }
         }
         Ok(p)
     }
@@ -2016,19 +2034,20 @@ impl Node {
                 continue;
             }
             if let (Some(k), Some(v)) = (key, parts.next())
-                && let Ok(val) = v.parse::<u32>() {
-                    match k {
-                        "processor_id_low" => p.processor_id_low = val,
-                        "level" => p.cache_level = val,
-                        "size" => p.cache_size = val,
-                        "cache_line_size" => p.cache_line_size = val,
-                        "cache_lines_per_tag" => p.cache_lines_per_tag = val,
-                        "association" => p.cache_associativity = val,
-                        "latency" => p.cache_latency = val,
-                        "type" => p.cache_type = val,
-                        _ => {}
-                    }
+                && let Ok(val) = v.parse::<u32>()
+            {
+                match k {
+                    "processor_id_low" => p.processor_id_low = val,
+                    "level" => p.cache_level = val,
+                    "size" => p.cache_size = val,
+                    "cache_line_size" => p.cache_line_size = val,
+                    "cache_lines_per_tag" => p.cache_lines_per_tag = val,
+                    "association" => p.cache_associativity = val,
+                    "latency" => p.cache_latency = val,
+                    "type" => p.cache_type = val,
+                    _ => {}
                 }
+            }
         }
         Ok(p)
     }
@@ -2039,38 +2058,42 @@ impl Node {
         for line in content.lines() {
             let mut parts = line.split_whitespace();
             if let (Some(k), Some(v)) = (parts.next(), parts.next())
-                && let Ok(val) = v.parse::<u32>() {
-                    match k {
-                        "type" => p.type_ = val,
-                        "version_major" => p.version_major = val,
-                        "version_minor" => p.version_minor = val,
-                        "node_from" => p.node_from = val,
-                        "node_to" => p.node_to = val,
-                        "weight" => p.weight = val,
-                        "min_latency" => p.min_latency = val,
-                        "max_latency" => p.max_latency = val,
-                        "min_bandwidth" => p.min_bandwidth = val,
-                        "max_bandwidth" => p.max_bandwidth = val,
-                        "recommended_transfer_size" => p.rec_transfer_size = val,
-                        "recommended_sdma_engine_id_mask" => p.rec_sdma_eng_id_mask = val,
-                        "flags" => p.flags = val,
-                        _ => {}
-                    }
+                && let Ok(val) = v.parse::<u32>()
+            {
+                match k {
+                    "type" => p.type_ = val,
+                    "version_major" => p.version_major = val,
+                    "version_minor" => p.version_minor = val,
+                    "node_from" => p.node_from = val,
+                    "node_to" => p.node_to = val,
+                    "weight" => p.weight = val,
+                    "min_latency" => p.min_latency = val,
+                    "max_latency" => p.max_latency = val,
+                    "min_bandwidth" => p.min_bandwidth = val,
+                    "max_bandwidth" => p.max_bandwidth = val,
+                    "recommended_transfer_size" => p.rec_transfer_size = val,
+                    "recommended_sdma_engine_id_mask" => p.rec_sdma_eng_id_mask = val,
+                    "flags" => p.flags = val,
+                    _ => {}
                 }
+            }
         }
         Ok(p)
     }
 
-    fn parse_sub_objects<T, F>(dir: &Path, parse_func: F) -> io::Result<Vec<T>>
+    fn parse_sub_objects<T, F>(dir: &Path, parse_func: F) -> Vec<T>
     where
         F: Fn(&Path) -> io::Result<T>,
     {
         let mut results = Vec::new();
         if !dir.exists() {
-            return Ok(results);
+            return results;
         }
         if let Ok(entries) = fs::read_dir(dir) {
-            let mut paths: Vec<_> = entries.filter_map(std::result::Result::ok).map(|e| e.path()).collect();
+            let mut paths: Vec<_> = entries
+                .filter_map(std::result::Result::ok)
+                .map(|e| e.path())
+                .collect();
             paths.sort_by_key(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
@@ -2083,11 +2106,12 @@ impl Node {
                     .and_then(|n| n.to_str())
                     .and_then(|s| s.parse::<u32>().ok())
                     .is_some()
-                    && let Ok(obj) = parse_func(&path) {
-                        results.push(obj);
-                    }
+                    && let Ok(obj) = parse_func(&path)
+                {
+                    results.push(obj);
+                }
             }
         }
-        Ok(results)
+        results
     }
 }

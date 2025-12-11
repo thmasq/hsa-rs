@@ -17,7 +17,7 @@ pub struct Aperture {
 
 impl Aperture {
     #[must_use] 
-    pub fn new(base: u64, limit: u64, align: u64, guard_pages: u64) -> Self {
+    pub const fn new(base: u64, limit: u64, align: u64, guard_pages: u64) -> Self {
         Self {
             base,
             limit,
@@ -27,7 +27,7 @@ impl Aperture {
         }
     }
 
-    fn align_up(val: u64, align: u64) -> u64 {
+    const fn align_up(val: u64, align: u64) -> u64 {
         (val + align - 1) & !(align - 1)
     }
 }

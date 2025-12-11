@@ -1,3 +1,5 @@
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 use crate::kfd::device::KfdDevice;
 use crate::kfd::ioctl::{
     CreateQueueArgs, KFD_IOC_QUEUE_TYPE_COMPUTE, KFD_IOC_QUEUE_TYPE_COMPUTE_AQL,
@@ -142,126 +144,62 @@ impl<'a> QueueBuilder<'a> {
         }
     }
 
-    #[must_use] 
-    pub fn with_type(mut self, t: QueueType) -> Self {
+    #[must_use]
+    pub const fn with_type(mut self, t: QueueType) -> Self {
         self.queue_type = t;
         self
     }
 
-    #[must_use] 
-    pub fn with_priority(mut self, p: QueuePriority) -> Self {
+    #[must_use]
+    pub const fn with_priority(mut self, p: QueuePriority) -> Self {
         self.priority = p;
         self
     }
 
+    /// Creates the queue in the KFD and allocates necessary resources.
+    ///
+    /// # Errors
+    /// Returns `i32` error codes (typically -1) if allocation or IOCTLs fail.
+    ///
+    /// # Panics
+    /// Panics if CWSR is allocated but the size calculation returns `None` during the IOCTL setup phase.
+    /// This indicates an internal logic inconsistency where memory was allocated based on sizes,
+    /// but the sizes are missing when needed later.
     pub fn create(mut self) -> Result<HsaQueue, i32> {
         let gfx_version = self.node_props.gfx_target_version;
         let is_compute = matches!(self.queue_type, QueueType::Compute | QueueType::ComputeAql);
 
         // 1. Prepare EOP (End-Of-Pipe) Buffer
-        let eop_size = self.calculate_eop_size(gfx_version, is_compute);
-        let mut eop_mem = None;
-
-        if eop_size > 0 {
-            let mut alloc_res = self.mem_mgr.allocate_gpu_memory(
-                self.device,
-                eop_size,
-                4096,
-                true, // Try VRAM first
-                true,
-                self.drm_fd,
-            );
-
-            if alloc_res.is_err() {
-                // Fallback to GTT
-                alloc_res = self.mem_mgr.allocate_gpu_memory(
-                    self.device,
-                    eop_size,
-                    4096,
-                    false, // VRAM=false -> GTT
-                    true,
-                    self.drm_fd,
-                );
-            }
-
-            let alloc = alloc_res.inspect_err(|_e| {
-                eprintln!("Failed to allocate EOP buffer");
-            })?;
-
-            unsafe {
-                ptr::write_bytes(alloc.ptr, 0, eop_size);
-            }
-            eop_mem = Some(alloc);
-        }
+        let eop_mem = self.alloc_eop(gfx_version, is_compute)?;
 
         // 2. Prepare CWSR (Context Save/Restore) Area
         // Only for GFX8+ (Carrizo+)
-        let mut cwsr_mem = None;
-        let mut cwsr_sizes = None;
-
-        if gfx_version >= 80000 && is_compute
-            && let Some(sizes) = cwsr::calculate_sizes(self.node_props) {
-                // CWSR prefers GTT (Host Allocated) so CPU can write the header easily.
-                let alloc = self
-                    .mem_mgr
-                    .allocate_gpu_memory(
-                        self.device,
-                        sizes.total_mem_alloc_size as usize,
-                        4096,
-                        false,
-                        false,
-                        self.drm_fd,
-                    )
-                    .inspect_err(|_e| {
-                        eprintln!("Failed to allocate CWSR");
-                    })?;
-
-                // Initialize Header
-                unsafe {
-                    cwsr::init_header(
-                        alloc.ptr,
-                        &sizes,
-                        self.node_props.num_xcc,
-                        0, // ErrorEventId (placeholder)
-                        0, // ErrorReason (placeholder)
-                    );
-                }
-
-                cwsr_sizes = Some(sizes);
-                cwsr_mem = Some(alloc);
-            }
+        let (cwsr_mem, cwsr_sizes) = self.alloc_cwsr(gfx_version, is_compute)?;
 
         // 3. Allocate Queue Read/Write Pointers (if needed)
         // These are small 64-bit counters usually placed in a 4K page.
-        let ptr_alloc = self
-            .mem_mgr
-            .allocate_gpu_memory(self.device, 4096, 4096, false, true, self.drm_fd)
-            .inspect_err(|_e| {
-                eprintln!("Failed to allocate queue pointers");
-            })?;
+        let ptr_mem = self.alloc_pointers()?;
 
-        unsafe {
-            ptr::write_bytes(ptr_alloc.ptr, 0, 4096);
-        }
-
-        let rptr_va = ptr_alloc.gpu_va;
-        let wptr_va = ptr_alloc.gpu_va + 8;
-        let ptr_mem = Some(ptr_alloc);
+        let rptr_va = ptr_mem.gpu_va;
+        let wptr_va = ptr_mem.gpu_va + 8;
+        let ptr_mem = Some(ptr_mem);
 
         // 4. Setup IOCTL Arguments
-        let mut args = CreateQueueArgs::default();
-        args.gpu_id = self.node_props.kfd_gpu_id;
-        args.ring_base_address = self.ring_base;
-        args.ring_size = self.ring_size as u32;
-        args.queue_type = match self.queue_type {
-            QueueType::Compute => KFD_IOC_QUEUE_TYPE_COMPUTE,
-            QueueType::Sdma => KFD_IOC_QUEUE_TYPE_SDMA,
-            QueueType::ComputeAql => KFD_IOC_QUEUE_TYPE_COMPUTE_AQL,
-            QueueType::SdmaXgmi => KFD_IOC_QUEUE_TYPE_SDMA_XGMI,
+        let mut args = CreateQueueArgs {
+            gpu_id: self.node_props.kfd_gpu_id,
+            ring_base_address: self.ring_base,
+            ring_size: self.ring_size as u32,
+            queue_type: match self.queue_type {
+                QueueType::Compute => KFD_IOC_QUEUE_TYPE_COMPUTE,
+                QueueType::Sdma => KFD_IOC_QUEUE_TYPE_SDMA,
+                QueueType::ComputeAql => KFD_IOC_QUEUE_TYPE_COMPUTE_AQL,
+                QueueType::SdmaXgmi => KFD_IOC_QUEUE_TYPE_SDMA_XGMI,
+            },
+            queue_percentage: self.percentage,
+            queue_priority: Self::map_priority(self.priority),
+            sdma_engine_id: self.sdma_engine_id,
+            ..Default::default()
         };
-        args.queue_percentage = self.percentage;
-        args.queue_priority = self.map_priority(self.priority);
-        args.sdma_engine_id = self.sdma_engine_id;
 
         // Pointers setup
         if self.queue_type == QueueType::ComputeAql {
@@ -279,9 +217,10 @@ impl<'a> QueueBuilder<'a> {
             args.eop_buffer_size = eop.size as u64;
         }
         if let Some(cwsr) = &cwsr_mem {
+            let sizes = cwsr_sizes.as_ref().unwrap();
             args.ctx_save_restore_address = cwsr.gpu_va;
-            args.ctx_save_restore_size = cwsr_sizes.as_ref().unwrap().ctx_save_restore_size;
-            args.ctl_stack_size = cwsr_sizes.as_ref().unwrap().ctl_stack_size;
+            args.ctx_save_restore_size = sizes.ctx_save_restore_size;
+            args.ctl_stack_size = sizes.ctl_stack_size;
         }
 
         // 5. Call KFD CreateQueue IOCTL
@@ -312,8 +251,99 @@ impl<'a> QueueBuilder<'a> {
         })
     }
 
+    fn alloc_eop(&mut self, gfx_version: u32, is_compute: bool) -> Result<Option<Allocation>, i32> {
+        let eop_size = Self::calculate_eop_size(gfx_version, is_compute);
+        if eop_size > 0 {
+            let mut alloc_res = self.mem_mgr.allocate_gpu_memory(
+                self.device,
+                eop_size,
+                4096,
+                true, // Try VRAM first
+                true,
+                self.drm_fd,
+            );
+
+            if alloc_res.is_err() {
+                // Fallback to GTT
+                alloc_res = self.mem_mgr.allocate_gpu_memory(
+                    self.device,
+                    eop_size,
+                    4096,
+                    false, // VRAM=false -> GTT
+                    true,
+                    self.drm_fd,
+                );
+            }
+
+            let alloc = alloc_res.inspect_err(|_e| {
+                eprintln!("Failed to allocate EOP buffer");
+            })?;
+
+            unsafe {
+                ptr::write_bytes(alloc.ptr, 0, eop_size);
+            }
+            Ok(Some(alloc))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn alloc_cwsr(
+        &mut self,
+        gfx_version: u32,
+        is_compute: bool,
+    ) -> Result<(Option<Allocation>, Option<cwsr::CwsrSizes>), i32> {
+        if gfx_version >= 80000
+            && is_compute
+            && let Some(sizes) = cwsr::calculate_sizes(self.node_props)
+        {
+            // CWSR prefers GTT (Host Allocated) so CPU can write the header easily.
+            let alloc = self
+                .mem_mgr
+                .allocate_gpu_memory(
+                    self.device,
+                    sizes.total_mem_alloc_size as usize,
+                    4096,
+                    false,
+                    false,
+                    self.drm_fd,
+                )
+                .inspect_err(|_e| {
+                    eprintln!("Failed to allocate CWSR");
+                })?;
+
+            // Initialize Header
+            unsafe {
+                cwsr::init_header(
+                    alloc.ptr,
+                    &sizes,
+                    self.node_props.num_xcc,
+                    0, // ErrorEventId (placeholder)
+                    0, // ErrorReason (placeholder)
+                );
+            }
+
+            return Ok((Some(alloc), Some(sizes)));
+        }
+        Ok((None, None))
+    }
+
+    fn alloc_pointers(&mut self) -> Result<Allocation, i32> {
+        let ptr_alloc = self
+            .mem_mgr
+            .allocate_gpu_memory(self.device, 4096, 4096, false, true, self.drm_fd)
+            .inspect_err(|_e| {
+                eprintln!("Failed to allocate queue pointers");
+            })?;
+
+        unsafe {
+            ptr::write_bytes(ptr_alloc.ptr, 0, 4096);
+        }
+        Ok(ptr_alloc)
+    }
+
     /// Determines EOP buffer size based on ASIC generation.
-    fn calculate_eop_size(&self, gfx_version: u32, is_compute: bool) -> usize {
+    const fn calculate_eop_size(gfx_version: u32, is_compute: bool) -> usize {
         let major = (gfx_version / 10000) % 100;
         let minor = (gfx_version / 100) % 100;
 
@@ -331,7 +361,7 @@ impl<'a> QueueBuilder<'a> {
     }
 
     /// Calculates priority integer
-    fn map_priority(&self, p: QueuePriority) -> u32 {
+    const fn map_priority(p: QueuePriority) -> u32 {
         match p {
             QueuePriority::Minimum => 0,
             QueuePriority::Low => 3,
@@ -354,15 +384,15 @@ impl<'a> QueueBuilder<'a> {
         // Doorbell page size logic: SOC15+ uses 8 byte doorbells (conceptually), pre-SOC15 4KB.
         let doorbell_page_size = if gfx_version >= 90000 { 8 } else { 4 } * 1024;
 
-        let mut mmap_offset = kernel_offset;
-        let mut ptr_offset = 0;
+        let mask = (doorbell_page_size - 1) as u64;
 
-        if is_soc15 {
-            // For SOC15, mask off the offset within the page to get the base mmap offset
-            let mask = (doorbell_page_size - 1) as u64;
-            mmap_offset = kernel_offset & !mask;
-            ptr_offset = kernel_offset & mask;
-        }
+        let mmap_offset = if is_soc15 {
+            kernel_offset & !mask
+        } else {
+            kernel_offset
+        };
+
+        let ptr_offset = if is_soc15 { kernel_offset & mask } else { 0 };
 
         let base_ptr = self.mem_mgr.map_doorbell(
             self.device,
@@ -372,6 +402,9 @@ impl<'a> QueueBuilder<'a> {
             doorbell_page_size as u64,
         )?;
 
+        // Safety: The cast from *mut u8 to *mut u32 is guarded by the hardware logic.
+        // The Kernel ensures `kernel_offset` corresponds to a valid 4-byte aligned doorbell register.
+        #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             // base_ptr is the start of the page. Add the offset to get the specific queue doorbell.
             let byte_ptr = base_ptr.cast::<u8>().add(ptr_offset as usize);
