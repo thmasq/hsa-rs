@@ -69,20 +69,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Allocate Ring Buffer
     // The Thunk QueueBuilder expects us to provide the memory for the ring itself.
-    // We allocate 64KB in GTT (System Memory), which is accessible by both Host and Device.
+    // We allocate 64KB in GTT (System Memory) which is host accessible.
+    // We use the new `allocate_gtt` utility method.
     let ring_size = 64 * 1024;
     println!("[+] Allocating {} KB Ring Buffer...", ring_size / 1024);
 
     let ring_mem = mem_mgr
-        .allocate_gpu_memory(
-            &device,
-            ring_size,
-            4096,  // Page alignment
-            false, // VRAM = false (Use GTT/System)
-            true,  // Public = true (Host Accessible)
-            gpu_idx as u32,
-            drm_file.as_raw_fd(),
-        )
+        .allocate_gtt(&device, ring_size, gpu_idx as u32, drm_file.as_raw_fd())
         .map_err(|e| format!("Ring buffer allocation failed (Err: {})", e))?;
 
     println!("    GPU VA:  0x{:012x}", ring_mem.gpu_va);

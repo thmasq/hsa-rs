@@ -43,6 +43,69 @@ pub struct AllocFlags {
     pub lds: bool,
 }
 
+impl AllocFlags {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn vram(mut self) -> Self {
+        self.vram = true;
+        self
+    }
+
+    pub fn gtt(mut self) -> Self {
+        self.gtt = true;
+        self.host_access = true;
+        self.coherent = true;
+        self
+    }
+
+    pub fn doorbell(mut self) -> Self {
+        self.doorbell = true;
+        self
+    }
+
+    pub fn host_access(mut self) -> Self {
+        self.host_access = true;
+        self
+    }
+
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+
+    pub fn executable(mut self) -> Self {
+        self.execute_access = true;
+        self
+    }
+
+    pub fn coherent(mut self) -> Self {
+        self.coherent = true;
+        self
+    }
+
+    pub fn uncached(mut self) -> Self {
+        self.uncached = true;
+        self
+    }
+
+    pub fn aql_queue_mem(mut self) -> Self {
+        self.aql_queue_mem = true;
+        self
+    }
+
+    pub fn no_substitute(mut self) -> Self {
+        self.no_substitute = true;
+        self
+    }
+
+    pub fn contiguous(mut self) -> Self {
+        self.contiguous = true;
+        self
+    }
+}
+
 /// Per-GPU Apertures derived from KFD Process Info
 #[derive(Debug)]
 struct GpuApertures {
@@ -66,22 +129,17 @@ pub struct MemoryManager {
 
 impl MemoryManager {
     /// Initialize the FMM context by querying KFD for process apertures.
-    /// Replicates logic from `hsakmt_fmm_init_process_apertures` in fmm.c
     pub fn new(device: &KfdDevice, nodes: &[HsaNodeProperties]) -> Result<Self, i32> {
         // 1. Build Node->GPU mapping
         let mut node_to_gpu_id = HashMap::new();
-        let mut gpu_nodes = Vec::new();
 
         for (idx, node) in nodes.iter().enumerate() {
             if node.kfd_gpu_id != 0 {
                 node_to_gpu_id.insert(idx as u32, node.kfd_gpu_id);
-                gpu_nodes.push(idx as u32);
             }
         }
 
         // 2. Query Process Apertures from KFD
-        // We need to allocate space for the kernel to fill.
-        // We use the count of ALL nodes (CPU+GPU) as `num_of_nodes` expected by KFD.
         let num_sysfs_nodes = nodes.len() as u32;
         let mut apertures_vec = vec![ProcessDeviceApertures::default(); num_sysfs_nodes as usize];
 
@@ -100,12 +158,9 @@ impl MemoryManager {
         let mut gpu_apertures = HashMap::new();
         let mut max_gpuvm_limit = 0;
 
-        // Iterate through returned apertures
-        // Note: The array index in `apertures_vec` might not map 1:1 to NodeID if KFD logic differs,
-        // but typically `GetProcessApertures` returns dense array matching sysfs node order.
-        for (i, aperture_info) in apertures_vec.iter().enumerate() {
+        for aperture_info in apertures_vec.iter() {
             if aperture_info.gpu_id == 0 {
-                continue; // Skip CPU nodes
+                continue;
             }
 
             // Find the node_id that corresponds to this gpu_id
@@ -117,19 +172,13 @@ impl MemoryManager {
                 None => continue,
             };
 
-            // Setup specific apertures
-            let lds = Aperture::new(
-                aperture_info.lds_base,
-                aperture_info.lds_limit,
-                4096,
-                0, // No guard pages for LDS
-            );
+            let lds = Aperture::new(aperture_info.lds_base, aperture_info.lds_limit, 4096, 0);
 
             let scratch = Aperture::new(
                 aperture_info.scratch_base,
                 aperture_info.scratch_limit,
                 4096,
-                0, // No guard pages for Scratch
+                0,
             );
 
             // GPUVM Aperture (for non-canonical or specific ranges)
@@ -195,41 +244,24 @@ impl MemoryManager {
         })
     }
 
-    /// Primary Allocation Function.
-    /// Corresponds to `hsakmt_fmm_allocate_device`.
-    pub fn allocate_gpu_memory(
+    /// Unified Allocation Function.
+    ///
+    /// This is the primary entry point for memory allocation.
+    /// It handles selecting the correct aperture (SVM, Scratch, LDS, etc.) based on flags,
+    /// calls the KFD IOCTL, and maps the memory.
+    pub fn allocate(
         &mut self,
         device: &KfdDevice,
-        size: usize,
-        align: usize,
-        vram: bool,
-        public: bool,
-        node_id: u32,
-        drm_fd: std::os::unix::io::RawFd,
-    ) -> Result<Allocation, i32> {
-        // Construct standard flags based on params
-        let mut flags = AllocFlags::default();
-        flags.vram = vram;
-        flags.gtt = !vram;
-        flags.host_access = public || !vram; // GTT is host accessible by default
-        flags.execute_access = true;
-        flags.coherent = !vram; // GTT coherent by default
-        flags.no_substitute = vram && !public; // Private VRAM shouldn't fallback easily
-
-        self.allocate_memory_flags(device, node_id, size, align, flags, drm_fd) // Pass it down
-    }
-
-    /// Full allocation function with explicit flags
-    pub fn allocate_memory_flags(
-        &mut self,
-        device: &KfdDevice,
-        node_id: u32,
         size: usize,
         align: usize,
         flags: AllocFlags,
-        drm_fd: std::os::unix::io::RawFd,
+        node_id: Option<u32>,
+        drm_fd: RawFd,
     ) -> Result<Allocation, i32> {
         let size = if size == 0 { 4096 } else { size };
+
+        // Default to the first GPU node if none specified
+        let node_id = node_id.unwrap_or_else(|| *self.node_to_gpu_id.keys().next().unwrap_or(&0));
 
         // 1. Select Aperture
         let aperture = if flags.scratch {
@@ -378,8 +410,46 @@ impl MemoryManager {
         Ok(allocation)
     }
 
+    /// Allocates executable memory on the GPU with specific alignment.
+    /// Commonly used for loading code objects (ISA).
+    pub fn allocate_exec_aligned_memory_gpu(
+        &mut self,
+        device: &KfdDevice,
+        size: usize,
+        align: usize,
+        node_id: u32,
+        drm_fd: RawFd,
+    ) -> Result<Allocation, i32> {
+        let flags = AllocFlags::new().vram().executable().no_substitute();
+
+        self.allocate(device, size, align, flags, Some(node_id), drm_fd)
+    }
+
+    /// Allocates standard VRAM buffer.
+    pub fn allocate_vram(
+        &mut self,
+        device: &KfdDevice,
+        size: usize,
+        node_id: u32,
+        drm_fd: RawFd,
+    ) -> Result<Allocation, i32> {
+        let flags = AllocFlags::new().vram();
+        self.allocate(device, size, 0, flags, Some(node_id), drm_fd)
+    }
+
+    /// Allocates system memory (GTT) accessible by GPU.
+    pub fn allocate_gtt(
+        &mut self,
+        device: &KfdDevice,
+        size: usize,
+        node_id: u32,
+        drm_fd: RawFd,
+    ) -> Result<Allocation, i32> {
+        let flags = AllocFlags::new().gtt();
+        self.allocate(device, size, 0, flags, Some(node_id), drm_fd)
+    }
+
     /// Map a doorbell index to a CPU virtual address.
-    /// Used by QueueBuilder.
     pub fn map_doorbell(
         &mut self,
         device: &KfdDevice,
@@ -388,14 +458,13 @@ impl MemoryManager {
         doorbell_offset: u64,
         size: u64,
     ) -> Result<*mut u32, i32> {
-        let size = size as usize;
+        // Doorbell allocation is specialized, so we manually construct the flags here
+        // or we could use the generic allocate with doorbell flags if we refactor deeper.
+        // For now, keeping the optimized path but using the AllocFlags struct.
 
-        // 1. Allocate VA from Alt Aperture (Uncached/Fine Grain)
-        // Ensure alignment matches the size (usually page aligned)
+        let size = size as usize;
         let va_addr = self.svm_alt_aperture.allocate_va(size, 4096).ok_or(-12)?;
 
-        // 2. KFD Alloc (Doorbell)
-        // flags: DOORBELL | WRITABLE | COHERENT | NO_SUBSTITUTE
         let flags = KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL
             | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
             | KFD_IOC_ALLOC_MEM_FLAGS_COHERENT
@@ -416,8 +485,6 @@ impl MemoryManager {
             return Err(-1);
         }
 
-        // 3. mmap to CPU
-        // We use the mmap_offset returned by KFD (which might differ from input)
         let cpu_ptr;
         unsafe {
             let ret = libc::mmap(
@@ -430,10 +497,6 @@ impl MemoryManager {
             );
 
             if ret == libc::MAP_FAILED {
-                eprintln!(
-                    "[ERROR] map_doorbell: mmap failed (errno: {})",
-                    std::io::Error::last_os_error()
-                );
                 device.free_memory_of_gpu(args.handle).ok();
                 self.svm_alt_aperture.free_va(va_addr, size);
                 return Err(-1);
@@ -468,7 +531,6 @@ impl MemoryManager {
             device.free_memory_of_gpu(handle).ok();
 
             // 3. Free VA
-            // Identify which aperture owns this address
             if alloc.gpu_va >= self.svm_aperture.bounds().0
                 && alloc.gpu_va < self.svm_aperture.bounds().1
             {
@@ -478,7 +540,6 @@ impl MemoryManager {
             {
                 self.svm_alt_aperture.free_va(alloc.gpu_va, alloc.size);
             } else {
-                // Check GPU specific apertures
                 if let Some(gpu_aps) = self.gpu_apertures.get_mut(&alloc.node_id) {
                     if alloc.gpu_va >= gpu_aps.scratch.bounds().0
                         && alloc.gpu_va < gpu_aps.scratch.bounds().1
@@ -511,6 +572,7 @@ impl MemoryManager {
     }
 }
 
+// Implement the Trait for QueueBuilder usage, forwarding to the unified alloc
 impl BuilderMemoryManager for MemoryManager {
     fn allocate_gpu_memory(
         &mut self,
@@ -521,21 +583,23 @@ impl BuilderMemoryManager for MemoryManager {
         public: bool,
         drm_fd: RawFd,
     ) -> Result<Allocation, i32> {
-        // Forward to the inherent method
-        // We assume node_id 0 for simple single-GPU cases, or you can expand QueueBuilder
-        // to pass the specific node_id via the trait if needed.
-        // Ideally, the QueueBuilder should pass the node_id in the trait method,
-        // but for now we default to 0 (First GPU) or find the first GPU.
+        let mut flags = AllocFlags::new();
+        if vram {
+            flags = flags.vram();
+            if !public {
+                flags = flags.no_substitute();
+            }
+        } else {
+            flags = flags.gtt();
+        }
+        if public {
+            flags = flags.host_access();
+        }
 
-        // Since MemoryManager holds gpu_apertures mapped by node_id, we need a node_id.
-        // For the queue builder usage, it is usually allocating EOP/CWSR for the target GPU.
-        // We will infer node_id 0 for now as the trait signature in builder doesn't carry node_id
-        // (except for map_doorbell).
-        // *Correction*: allocate_memory_flags needs a node_id.
-        // Let's use the first available GPU node from our map for now.
-        let node_id = *self.node_to_gpu_id.keys().next().unwrap_or(&0);
+        // Queue buffers typically need execute access and coherency
+        flags = flags.executable().coherent();
 
-        self.allocate_gpu_memory(device, size, align, vram, public, node_id, drm_fd)
+        self.allocate(device, size, align, flags, None, drm_fd)
     }
 
     fn free_gpu_memory(&mut self, device: &KfdDevice, alloc: &Allocation) {
