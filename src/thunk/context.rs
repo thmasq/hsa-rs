@@ -141,6 +141,6 @@ fn get_isa_name(engine_id: &EngineId) -> String {
         // Assume non-GPU agents (CPUs) don't have an ISA name in this context.
         0 => "cpu".to_string(),
         // Simple case: gfx900, gfx1010, gfx1100 format
-        _ => format!("gfx{major}{minor:02}{stepping:02}"),
+        _ => format!("gfx{}{}{}", major, minor, stepping),
     }
 }

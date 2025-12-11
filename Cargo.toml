@@ -21,3 +21,7 @@ path = "examples/event_test.rs"
 [[example]]
 name = "extended_diagnostics"
 path = "examples/extended_diagnostics.rs"
+
+[[example]]
+name = "print_context_info"
+path = "examples/print_context_info.rs"
