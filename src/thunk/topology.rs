@@ -32,8 +32,6 @@ const GFX_VERSION_KAVERI: u32 = 70000;
 // Extended Topology Data
 // ===============================================================================================
 
-/// Stores dynamic aperture limits queried from KFD IOCTLs.
-/// These are NOT in sysfs and must be queried per process.
 #[derive(Debug, Clone, Default)]
 struct NodeApertures {
     lds_base: u64,
@@ -45,7 +43,6 @@ struct NodeApertures {
 }
 
 /// The runtime topology snapshot.
-/// Wraps the static Sysfs topology and adds dynamic runtime info.
 #[derive(Debug, Clone)]
 pub struct Topology {
     inner: SysfsTopology,
@@ -53,7 +50,6 @@ pub struct Topology {
     is_dgpu: bool,
 }
 
-// Global singleton to match libhsakmt's g_system / g_props
 static GLOBAL_TOPOLOGY: Mutex<Option<Arc<Topology>>> = Mutex::new(None);
 
 // ===============================================================================================
@@ -62,25 +58,22 @@ static GLOBAL_TOPOLOGY: Mutex<Option<Arc<Topology>>> = Mutex::new(None);
 
 impl Topology {
     /// Captures the system topology.
-    /// 1. Reads Sysfs (reusing kfd::sysfs logic).
-    /// 2. Checks generation_id for consistency.
-    /// 3. Queries KFD for process apertures.
+    ///
+    /// # Panics
+    /// Panics if reading the sysfs topology locking logic internally panics.
     fn new() -> io::Result<Self> {
         let mut retries = 0;
         loop {
-            // Sysfs topology generation check loop
             let gen_start = SysfsTopology::get_generation_id().unwrap_or(0);
             let sys_topo = SysfsTopology::get_snapshot()?;
             let gen_end = SysfsTopology::get_generation_id().unwrap_or(0);
 
             if gen_start == gen_end || retries > 5 {
-                // Determine dGPU status (Any node with SIMDs but no CPU cores)
                 let is_dgpu = sys_topo
                     .nodes
                     .iter()
                     .any(|n| n.properties.simd_count > 0 && n.properties.cpu_cores_count == 0);
 
-                // Fetch aperture limits via IOCTL
                 let apertures = Self::fetch_apertures(&sys_topo.nodes)?;
 
                 return Ok(Self {
@@ -93,7 +86,6 @@ impl Topology {
         }
     }
 
-    /// Queries KFD IOCTLs to get the virtual address ranges for LDS, Scratch, etc.
     fn fetch_apertures(nodes: &[sysfs::Node]) -> io::Result<HashMap<u32, NodeApertures>> {
         let kfd = KfdDevice::open()?;
         let mut map = HashMap::new();
@@ -108,10 +100,10 @@ impl Topology {
             return Ok(map);
         }
 
+        #[allow(clippy::cast_possible_truncation)]
         let num_nodes = gpu_nodes.len() as u32;
         let mut aps_vec = vec![ProcessDeviceApertures::default(); num_nodes as usize];
 
-        // Attempt New API
         let mut args_new = GetProcessAperturesNewArgs {
             kfd_process_device_apertures_ptr: aps_vec.as_mut_ptr() as u64,
             num_of_nodes: num_nodes,
@@ -125,15 +117,14 @@ impl Topology {
                 }
             }
         } else {
-            // Fallback to Old API (Limit 7 GPUs)
             let mut args_old = GetProcessAperturesArgs {
                 process_apertures: [ProcessDeviceApertures::default(); NUM_OF_SUPPORTED_GPUS],
+                #[allow(clippy::cast_possible_truncation)]
                 num_of_nodes: NUM_OF_SUPPORTED_GPUS as u32,
                 pad: 0,
             };
             if kfd.get_process_apertures(&mut args_old).is_ok() {
-                for i in 0..NUM_OF_SUPPORTED_GPUS {
-                    let ap = &args_old.process_apertures[i];
+                for ap in &args_old.process_apertures {
                     if ap.gpu_id != 0 {
                         map.insert(ap.gpu_id, Self::convert_aperture(ap));
                     }
@@ -144,7 +135,7 @@ impl Topology {
         Ok(map)
     }
 
-    fn convert_aperture(src: &ProcessDeviceApertures) -> NodeApertures {
+    const fn convert_aperture(src: &ProcessDeviceApertures) -> NodeApertures {
         NodeApertures {
             lds_base: src.lds_base,
             lds_limit: src.lds_limit,
@@ -155,8 +146,7 @@ impl Topology {
         }
     }
 
-    /// Helper to decide if SVM memory bank should be synthesized
-    fn is_svm_needed(&self, props: &HsaNodeProperties) -> bool {
+    const fn is_svm_needed(&self, props: &HsaNodeProperties) -> bool {
         if self.is_dgpu {
             return true;
         }
@@ -170,6 +160,10 @@ impl Topology {
 // Public API Functions
 // ===============================================================================================
 
+/// Acquires and initializes the global system properties.
+///
+/// # Panics
+/// Panics if the global topology mutex is poisoned.
 pub fn acquire_system_properties() -> io::Result<HsaSystemProperties> {
     let mut guard = GLOBAL_TOPOLOGY.lock().unwrap();
     if guard.is_none() {
@@ -179,16 +173,25 @@ pub fn acquire_system_properties() -> io::Result<HsaSystemProperties> {
     Ok(guard.as_ref().unwrap().inner.system_props.clone())
 }
 
+/// Releases the global topology.
+///
+/// # Panics
+/// Panics if the global topology mutex is poisoned.
 pub fn release_system_properties() {
-    let mut guard = GLOBAL_TOPOLOGY.lock().unwrap();
-    *guard = None;
+    GLOBAL_TOPOLOGY.lock().unwrap().take();
 }
 
+/// Returns properties for a node.
+///
+/// # Panics
+/// Panics if the global topology mutex is poisoned.
 pub fn get_node_properties(node_id: u32) -> io::Result<HsaNodeProperties> {
-    let guard = GLOBAL_TOPOLOGY.lock().unwrap();
-    let topo = guard
+    let topo = GLOBAL_TOPOLOGY
+        .lock()
+        .unwrap()
         .as_ref()
-        .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?
+        .clone();
 
     let node = topo
         .inner
@@ -198,29 +201,29 @@ pub fn get_node_properties(node_id: u32) -> io::Result<HsaNodeProperties> {
 
     let mut props = node.properties.clone();
 
-    // Adjust memory bank count to include virtual heaps (LDS, Scratch, SVM)
-    // Matches topology.c: hsaKmtGetNodePropertiesCtx logic
     if props.kfd_gpu_id != 0 {
-        if topo.is_dgpu {
-            props.mem_banks_count += 3;
-        } else {
-            props.mem_banks_count += 3;
-        }
-        // MMIO check usually adds 1
-        props.mem_banks_count += 1;
+        // Unified branch — was identical on both sides
+        props.mem_banks_count += 3; // LDS + Scratch + SVM
+        props.mem_banks_count += 1; // MMIO
     }
 
     Ok(props)
 }
 
+/// Returns memory banks for a node.
+///
+/// # Panics
+/// Panics if the global topology mutex is poisoned.
 pub fn get_node_memory_properties(
     node_id: u32,
     num_banks: u32,
 ) -> io::Result<Vec<HsaMemoryProperties>> {
-    let guard = GLOBAL_TOPOLOGY.lock().unwrap();
-    let topo = guard
+    let topo = GLOBAL_TOPOLOGY
+        .lock()
+        .unwrap()
         .as_ref()
-        .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?
+        .clone();
 
     let node = topo
         .inner
@@ -230,7 +233,6 @@ pub fn get_node_memory_properties(
 
     let mut props = Vec::new();
 
-    // 1. Add Static Sysfs Banks
     for bank in &node.mem_banks {
         if props.len() >= num_banks as usize {
             break;
@@ -242,20 +244,17 @@ pub fn get_node_memory_properties(
         return Ok(props);
     }
 
-    // 2. Add Dynamic Apertures
     if let Some(ap) = topo.apertures.get(&node.properties.kfd_gpu_id) {
-        // LDS
         if props.len() < num_banks as usize && ap.lds_limit > ap.lds_base {
             props.push(HsaMemoryProperties {
                 heap_type: HSA_HEAPTYPE_GPU_LDS,
-                size_in_bytes: (node.properties.lds_size_in_kb as u64) * 1024,
+                size_in_bytes: u64::from(node.properties.lds_size_in_kb) * 1024,
                 flags: 0,
                 width: 0,
                 mem_clk_max: 0,
             });
         }
 
-        // Local Memory (Private) for Kaveri Legacy
         let ver = node.properties.engine_id.major * 10000
             + node.properties.engine_id.minor * 100
             + node.properties.engine_id.stepping;
@@ -273,7 +272,6 @@ pub fn get_node_memory_properties(
             });
         }
 
-        // Scratch
         if props.len() < num_banks as usize && ap.scratch_limit > ap.scratch_base {
             props.push(HsaMemoryProperties {
                 heap_type: HSA_HEAPTYPE_GPU_SCRATCH,
@@ -284,7 +282,6 @@ pub fn get_node_memory_properties(
             });
         }
 
-        // SVM (Shared Virtual Memory)
         if topo.is_svm_needed(&node.properties) && props.len() < num_banks as usize {
             let size = if ap.gpuvm_limit > ap.gpuvm_base {
                 (ap.gpuvm_limit - ap.gpuvm_base) + 1
@@ -302,11 +299,10 @@ pub fn get_node_memory_properties(
             }
         }
 
-        // MMIO Remap (Placeholder)
         if props.len() < num_banks as usize {
             props.push(HsaMemoryProperties {
                 heap_type: HSA_HEAPTYPE_MMIO_REMAP,
-                size_in_bytes: 4096, // Dummy size or fetch real aperture if available
+                size_in_bytes: 4096,
                 flags: 0,
                 width: 0,
                 mem_clk_max: 0,
@@ -317,15 +313,21 @@ pub fn get_node_memory_properties(
     Ok(props)
 }
 
+/// Returns cache properties.
+///
+/// # Panics
+/// Panics if the global topology mutex is poisoned.
 pub fn get_node_cache_properties(
     node_id: u32,
     _proc_id: u32,
     num_caches: u32,
 ) -> io::Result<Vec<HsaCacheProperties>> {
-    let guard = GLOBAL_TOPOLOGY.lock().unwrap();
-    let topo = guard
+    let topo = GLOBAL_TOPOLOGY
+        .lock()
+        .unwrap()
         .as_ref()
-        .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?
+        .clone();
 
     let node = topo
         .inner
@@ -337,14 +339,20 @@ pub fn get_node_cache_properties(
     Ok(node.caches[..count].to_vec())
 }
 
+/// Returns IO link properties.
+///
+/// # Panics
+/// Panics if the global topology mutex is poisoned.
 pub fn get_node_io_link_properties(
     node_id: u32,
     num_links: u32,
 ) -> io::Result<Vec<HsaIoLinkProperties>> {
-    let guard = GLOBAL_TOPOLOGY.lock().unwrap();
-    let topo = guard
+    let topo = GLOBAL_TOPOLOGY
+        .lock()
+        .unwrap()
         .as_ref()
-        .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?
+        .clone();
 
     let node = topo
         .inner
