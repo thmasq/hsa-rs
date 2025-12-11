@@ -31,6 +31,7 @@ const SVM_DEFAULT_ALIGN: usize = 4096;
 const SVM_GUARD_PAGES: usize = 1;
 
 /// Flags controlling memory allocation behavior (Maps to `HsaMemFlags`)
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AllocFlags {
     pub vram: bool,
@@ -122,6 +123,51 @@ impl AllocFlags {
         self.contiguous = true;
         self
     }
+
+    /// Converts high-level flags into the raw bitmask required by the KFD IOCTL.
+    const fn to_kfd_ioctl_flags(self) -> u32 {
+        let mut ioc_flags = 0;
+
+        if self.vram {
+            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_VRAM;
+            if self.no_substitute {
+                ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
+            }
+        }
+        if self.gtt {
+            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_GTT;
+        }
+        if self.doorbell {
+            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL;
+        }
+        if self.host_access {
+            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC;
+        }
+        // KFD Logic: WRITABLE is needed unless ReadOnly is explicit.
+        if !self.read_only {
+            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE;
+        }
+        if self.execute_access {
+            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE;
+        }
+        if self.coherent {
+            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
+        }
+        if self.uncached {
+            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED;
+        }
+        if self.extended_coherent {
+            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_EXT_COHERENT;
+        }
+        if self.aql_queue_mem {
+            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_AQL_QUEUE_MEM;
+        }
+        if self.contiguous {
+            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_CONTIGUOUS_BEST_EFFORT;
+        }
+
+        ioc_flags
+    }
 }
 
 /// Per-GPU Apertures derived from KFD Process Info
@@ -182,12 +228,11 @@ impl MemoryManager {
             }
 
             // Find the node_id that corresponds to this gpu_id
-            let node_id = match node_to_gpu_id
+            let Some((&node_id, _)) = node_to_gpu_id
                 .iter()
                 .find(|&(_, &gid)| gid == aperture_info.gpu_id)
-            {
-                Some((&nid, _)) => nid,
-                None => continue,
+            else {
+                continue;
             };
 
             let lds = Aperture::new(aperture_info.lds_base, aperture_info.lds_limit, 4096, 0);
@@ -298,45 +343,7 @@ impl MemoryManager {
         let va_addr = aperture.allocate_va(size, align).ok_or(-12 /* ENOMEM */)?;
 
         // 3. Prepare IOCTL Flags
-        let mut ioc_flags = 0;
-
-        if flags.vram {
-            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_VRAM;
-            if flags.no_substitute {
-                ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
-            }
-        }
-        if flags.gtt {
-            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_GTT;
-        }
-        if flags.doorbell {
-            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL;
-        }
-        if flags.host_access {
-            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC;
-        }
-        // KFD Logic: WRITABLE is needed unless ReadOnly is explicit.
-        if !flags.read_only {
-            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE;
-        }
-        if flags.execute_access {
-            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE;
-        }
-        if flags.coherent {
-            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
-        }
-        if flags.uncached {
-            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED;
-        }
-        if flags.extended_coherent {
-            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_EXT_COHERENT;
-        }
-        if flags.aql_queue_mem {
-            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_AQL_QUEUE_MEM;
-        }
-        if flags.contiguous {
-            ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_CONTIGUOUS_BEST_EFFORT;
-        }
+        let ioc_flags = flags.to_kfd_ioctl_flags();
 
         // 4. Call KFD Allocate
         let gpu_id = *self.node_to_gpu_id.get(&node_id).unwrap_or(&0);
