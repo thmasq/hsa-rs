@@ -156,14 +156,30 @@ impl<'a> QueueBuilder<'a> {
         let eop_size = self.calculate_eop_size(q.gfx_version, is_compute);
 
         if eop_size > 0 {
-            // Pass self.device to the allocator
-            let alloc = self
-                .mem_mgr
-                .allocate_gpu_memory(self.device, eop_size, 4096, true, false, self.drm_fd)
-                .map_err(|e| {
-                    eprintln!("Failed to allocate EOP");
-                    e
-                })?;
+            let mut alloc_res = self.mem_mgr.allocate_gpu_memory(
+                self.device,
+                eop_size,
+                4096,
+                true,
+                true,
+                self.drm_fd,
+            );
+
+            if alloc_res.is_err() {
+                alloc_res = self.mem_mgr.allocate_gpu_memory(
+                    self.device,
+                    eop_size,
+                    4096,
+                    false,
+                    true,
+                    self.drm_fd,
+                );
+            }
+
+            let alloc = alloc_res.map_err(|e| {
+                eprintln!("Failed to allocate EOP buffer");
+                e
+            })?;
 
             unsafe {
                 ptr::write_bytes(alloc.ptr, 0, eop_size);
