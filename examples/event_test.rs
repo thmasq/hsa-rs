@@ -58,8 +58,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nodes = vec![HsaNodeProperties::default(), mock_node];
 
     // 4. Initialize Managers
-    let mut memory_manager = MemoryManager::new(&device, &nodes)
+    // MemoryManager::new now returns Arc<Mutex<MemoryManager>>
+    let mem_mgr_arc = MemoryManager::new(&device, &nodes)
         .map_err(|e| format!("Failed to init Memory Manager: {}", e))?;
+
     let mut event_manager = EventManager::new(&nodes);
     println!("[+] Managers initialized");
 
@@ -73,16 +75,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    let mut event = event_manager
-        .create_event(
-            &device,
-            &mut memory_manager,
-            drm_fd,
-            &event_desc,
-            true,  // Manual Reset
-            false, // Is Signaled
-        )
-        .map_err(|e| format!("Failed to create event: {}", e))?;
+    // We MUST lock the memory manager to pass a mutable reference to create_event.
+    // We scope this so the lock is dropped immediately after creation.
+    let mut event = {
+        let mut guard = mem_mgr_arc.lock().unwrap();
+        event_manager
+            .create_event(
+                &device,
+                &mut *guard, // Dereference MutexGuard to &mut MemoryManager
+                drm_fd,
+                &event_desc,
+                true,  // Manual Reset
+                false, // Is Signaled
+            )
+            .map_err(|e| format!("Failed to create event: {}", e))?
+    };
 
     println!("[+] Created Event ID: {}", event.event_id);
     println!("    HW Event Page Slot: {}", event.hw_data2);

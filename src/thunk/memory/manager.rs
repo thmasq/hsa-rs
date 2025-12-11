@@ -18,12 +18,14 @@ use crate::kfd::ioctl::{
 };
 use crate::kfd::sysfs::HsaNodeProperties;
 use crate::thunk::memory::aperture::Aperture;
-use crate::thunk::memory::{Allocation, ApertureAllocator};
+use crate::thunk::memory::{Allocation, ApertureAllocator, ArcManager};
 use crate::thunk::queues::builder::MemoryManager as BuilderMemoryManager;
 use std::collections::HashMap;
+use std::mem;
 use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
+use std::sync::{Arc, Mutex, Weak};
 
 // Constants from fmm.c
 const SVM_RESERVATION_LIMIT: u64 = (1 << 47) - 1; // 47-bit VA limit
@@ -179,6 +181,7 @@ struct GpuApertures {
     _gpuvm: Aperture, // Canonical or Non-Canonical GPUVM aperture
 }
 
+#[derive(Debug)]
 pub struct MemoryManager {
     // Shared Virtual Memory (SVM) Apertures (System-wide)
     svm_aperture: Aperture,     // Coarse Grain / Default
@@ -189,12 +192,15 @@ pub struct MemoryManager {
 
     // Mappings
     node_to_gpu_id: HashMap<u32, u32>,
-    allocations: HashMap<u64, Allocation>,
+
+    // Weak self-reference allows Allocations to grab a lock on the Manager
+    // for cleanup (RAII), while avoiding reference cycles.
+    self_weak: Option<Weak<Mutex<Self>>>,
 }
 
 impl MemoryManager {
-    /// Initialize the FMM context by querying KFD for process apertures.
-    pub fn new(device: &KfdDevice, nodes: &[HsaNodeProperties]) -> HsaResult<Self> {
+    /// Initialize the FMM context and return a thread-safe, shared handle.
+    pub fn new(device: &KfdDevice, nodes: &[HsaNodeProperties]) -> HsaResult<ArcManager> {
         // 1. Build Node->GPU mapping
         let mut node_to_gpu_id = HashMap::new();
 
@@ -296,13 +302,28 @@ impl MemoryManager {
             SVM_GUARD_PAGES as u64,
         );
 
-        Ok(Self {
+        let mgr = Self {
             svm_aperture,
             svm_alt_aperture,
             gpu_apertures,
             node_to_gpu_id,
-            allocations: HashMap::new(),
-        })
+            self_weak: None, // Will be initialized after Arc creation
+        };
+
+        let arc_mgr = Arc::new(Mutex::new(mgr));
+
+        // Initialize the weak self-reference
+        {
+            let mut guard = arc_mgr.lock().unwrap();
+            guard.self_weak = Some(Arc::downgrade(&arc_mgr));
+        }
+
+        Ok(arc_mgr)
+    }
+
+    #[must_use] 
+    pub fn get_gpu_id(&self, node_id: u32) -> Option<u32> {
+        self.node_to_gpu_id.get(&node_id).copied()
     }
 
     /// Unified Allocation Function.
@@ -438,6 +459,13 @@ impl MemoryManager {
             }
         }
 
+        // Upgrade the weak self-reference to get the Arc manager for RAII
+        let manager_handle = self
+            .self_weak
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| HsaError::General("MemoryManager has been dropped".into()))?;
+
         let allocation = Allocation {
             ptr: cpu_ptr,
             size,
@@ -445,9 +473,11 @@ impl MemoryManager {
             handle: args.handle,
             is_userptr: false,
             node_id,
+            flags,
+            device: device.clone(),
+            manager_handle,
         };
 
-        self.allocations.insert(args.handle, allocation.clone());
         Ok(allocation)
     }
 
@@ -499,17 +529,23 @@ impl MemoryManager {
         doorbell_offset: u64,
         size: u64,
     ) -> HsaResult<*mut u32> {
-        // Doorbell allocation is specialized, so we manually construct the flags here
-        // or we could use the generic allocate with doorbell flags if we refactor deeper.
-        // For now, keeping the optimized path but using the AllocFlags struct.
+        // Doorbell allocation is specialized and requires mapping a specific physical
+        // offset provided by the Queue creation (doorbell_offset), unlike standard
+        // allocation which asks KFD to pick an offset.
+        // Therefore, we cannot easily delegate to `self.allocate` because of the mmap arguments.
 
         let size = size as usize;
+        let flags = AllocFlags::new().doorbell();
+
+        // 1. Allocate VA
         let va_addr = self
             .svm_alt_aperture
             .allocate_va(size, 4096)
             .ok_or(HsaError::OutOfMemory)?;
 
-        let flags = KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL
+        // 2. KFD Allocation
+        // Doorbells need specific flags.
+        let ioc_flags = KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL
             | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
             | KFD_IOC_ALLOC_MEM_FLAGS_COHERENT
             | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
@@ -520,7 +556,7 @@ impl MemoryManager {
             handle: 0,
             mmap_offset: 0,
             gpu_id,
-            flags,
+            flags: ioc_flags,
         };
 
         if let Err(e) = device.alloc_memory_of_gpu(&mut args) {
@@ -529,6 +565,7 @@ impl MemoryManager {
             return Err(HsaError::from(e));
         }
 
+        // 3. Mmap
         let cpu_ptr;
         unsafe {
             let ret = libc::mmap(
@@ -548,56 +585,38 @@ impl MemoryManager {
             cpu_ptr = ret.cast::<u32>();
         }
 
-        let alloc = Allocation {
+        // 4. RAII Construction
+        // We need the manager handle to construct the Allocation.
+        let manager_handle = self
+            .self_weak
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| HsaError::General("MemoryManager has been dropped".into()))?;
+
+        let allocation = Allocation {
             ptr: cpu_ptr.cast::<u8>(),
             size,
             gpu_va: va_addr,
             handle: args.handle,
             is_userptr: false,
             node_id,
+            flags,
+            device: device.clone(),
+            manager_handle,
         };
-        self.allocations.insert(args.handle, alloc);
+
+        // 5. Leak
+        // We intentionally forget the RAII object because we are returning a raw pointer
+        // to the user, and they expect this mapping to persist for the lifetime of the Queue.
+        // If we didn't forget, `allocation` would drop here, immediately unmapping the doorbell.
+        mem::forget(allocation);
 
         Ok(cpu_ptr)
     }
 
-    /// Free a previously allocated memory region
-    pub fn free_memory(&mut self, device: &KfdDevice, handle: u64) {
-        if let Some(alloc) = self.allocations.remove(&handle) {
-            // 1. Munmap CPU
-            if !alloc.ptr.is_null() {
-                unsafe {
-                    libc::munmap(alloc.ptr.cast(), alloc.size);
-                }
-            }
-
-            // 2. Free GPU (KFD unmaps internally from GPU)
-            device.free_memory_of_gpu(handle).ok();
-
-            // 3. Free VA
-            if alloc.gpu_va >= self.svm_aperture.bounds().0
-                && alloc.gpu_va < self.svm_aperture.bounds().1
-            {
-                self.svm_aperture.free_va(alloc.gpu_va, alloc.size);
-            } else if alloc.gpu_va >= self.svm_alt_aperture.bounds().0
-                && alloc.gpu_va < self.svm_alt_aperture.bounds().1
-            {
-                self.svm_alt_aperture.free_va(alloc.gpu_va, alloc.size);
-            } else if let Some(gpu_aps) = self.gpu_apertures.get_mut(&alloc.node_id) {
-                if alloc.gpu_va >= gpu_aps.scratch.bounds().0
-                    && alloc.gpu_va < gpu_aps.scratch.bounds().1
-                {
-                    gpu_aps.scratch.free_va(alloc.gpu_va, alloc.size);
-                } else if alloc.gpu_va >= gpu_aps.lds.bounds().0
-                    && alloc.gpu_va < gpu_aps.lds.bounds().1
-                {
-                    gpu_aps.lds.free_va(alloc.gpu_va, alloc.size);
-                }
-            }
-        }
-    }
-
-    fn free_va_from_flags(&mut self, addr: u64, size: usize, flags: &AllocFlags, node_id: u32) {
+    /// Internal helper: reclaim VA space.
+    /// Public crate-wide so that `Allocation::drop` can call it.
+    pub fn free_va_from_flags(&mut self, addr: u64, size: usize, flags: &AllocFlags, node_id: u32) {
         if flags.scratch {
             if let Some(g) = self.gpu_apertures.get_mut(&node_id) {
                 g.scratch.free_va(addr, size);
@@ -644,8 +663,9 @@ impl BuilderMemoryManager for MemoryManager {
         self.allocate(device, size, align, flags, None, drm_fd)
     }
 
-    fn free_gpu_memory(&mut self, device: &KfdDevice, alloc: &Allocation) {
-        self.free_memory(device, alloc.handle);
+    fn free_gpu_memory(&mut self, _device: &KfdDevice, _alloc: &Allocation) {
+        // No-op: The Allocation struct handles its own cleanup via Drop.
+        // We explicitly do not want to double-free.
     }
 
     fn map_doorbell(

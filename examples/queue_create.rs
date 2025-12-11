@@ -31,13 +31,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     // 3. Initialize Memory Manager (FMM)
-    // This reserves the Virtual Address apertures (SVM, etc.)
+    // Returns Arc<Mutex<MemoryManager>>
     println!("[+] Initializing Memory Manager (FMM)...");
-    let mut mem_mgr = MemoryManager::new(&device, &node_props)
+    let mem_mgr_arc = MemoryManager::new(&device, &node_props)
         .map_err(|e| format!("Failed to initialize MemoryManager (Err: {})", e))?;
 
     // 4. Select a GPU Node
-    // We search for the first node that has SIMD cores.
     let gpu_idx = topology
         .nodes
         .iter()
@@ -68,36 +67,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     device.acquire_vm(gpu_id, drm_file.as_raw_fd() as u32)?;
 
     // 5. Allocate Ring Buffer
-    // The Thunk QueueBuilder expects us to provide the memory for the ring itself.
-    // We allocate 64KB in GTT (System Memory), which is accessible by both Host and Device.
+    // We allocate 64KB in GTT (System Memory).
     let ring_size = 64 * 1024;
     println!("[+] Allocating {} KB Ring Buffer...", ring_size / 1024);
 
-    let ring_mem = mem_mgr
-        .allocate_gtt(&device, ring_size, gpu_idx as u32, drm_file.as_raw_fd())
-        .map_err(|e| format!("Ring buffer allocation failed (Err: {})", e))?;
+    // [FIX 1] Removed extra argument `mem_mgr_arc.clone()`
+    // [FIX 2] Scoped the lock so `guard` is dropped immediately after allocation.
+    let ring_mem = {
+        let mut guard = mem_mgr_arc.lock().unwrap();
+        guard
+            .allocate_gtt(&device, ring_size, gpu_idx as u32, drm_file.as_raw_fd())
+            .map_err(|e| format!("Ring buffer allocation failed (Err: {})", e))?
+    };
 
     println!("    GPU VA:  0x{:012x}", ring_mem.gpu_va);
     println!("    CPU Ptr: {:?}", ring_mem.ptr);
 
     // 6. Build the Queue
-    // This triggers the heavy lifting: Allocating CWSR/EOP buffers and mapping Doorbells.
     println!("[+] creating Compute Queue...");
-    let builder = QueueBuilder::new(
-        &device,
-        &mut mem_mgr,
-        &gpu_node.properties,
-        gpu_idx as u32,
-        drm_file.as_raw_fd(),
-        ring_mem.gpu_va,
-        ring_size as u64,
-    )
-    .with_type(QueueType::Compute)
-    .with_priority(QueuePriority::Normal);
 
-    let queue = builder
+    // [FIX 3] Scoped the lock again.
+    // We hold the lock ONLY while the builder is creating the queue.
+    // Once `queue` is returned, `guard` is dropped, releasing the lock.
+    let queue = {
+        let mut guard = mem_mgr_arc.lock().unwrap();
+
+        QueueBuilder::new(
+            &device,
+            &mut *guard, // Pass mutable reference to the manager
+            &gpu_node.properties,
+            gpu_idx as u32,
+            drm_file.as_raw_fd(),
+            ring_mem.gpu_va,
+            ring_size as u64,
+        )
+        .with_type(QueueType::Compute)
+        .with_priority(QueuePriority::Normal)
         .create()
-        .map_err(|e| format!("Queue creation failed (Err: {})", e))?;
+        .map_err(|e| format!("Queue creation failed (Err: {})", e))?
+    };
 
     // 7. Verify Success
     println!("============================================================");
@@ -108,25 +116,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("    Read Ptr VA:     0x{:012x}", queue.queue_read_ptr);
     println!("    Write Ptr VA:    0x{:012x}", queue.queue_write_ptr);
 
-    // Note: To actually execute work, you would now:
-    // 1. Write PM4 packets into `ring_mem.ptr`
-    // 2. Update the write pointer at `queue.queue_write_ptr`
-    // 3. Write to the doorbell at `queue.queue_doorbell`
-
     // 8. Cleanup
     println!("\n[+] cleaning up resources...");
 
-    // The HsaQueue struct now implements Drop.
-    // When `queue` goes out of scope here (or is dropped explicitly), it will:
-    // 1. Destroy the KFD Queue
-    // 2. Free the internal EOP and CWSR buffers
+    // The HsaQueue struct implements Drop.
+    // Because we scoped the locks above, the Mutex is FREE.
+    // When `queue` drops, it triggers Allocation::drop -> locks MemoryManager -> Success.
     drop(queue);
     println!("    Queue destroyed and internal resources freed");
 
     // Free the Ring Buffer
-    // This was allocated manually by us via mem_mgr, so we must free it manually.
-    mem_mgr.free_memory(&device, ring_mem.handle);
-    println!("    Ring buffer freed");
+    // Same here: Allocation::drop locks MemoryManager -> Success.
+    drop(ring_mem);
+    println!("    Ring buffer freed (RAII)");
 
     Ok(())
 }
