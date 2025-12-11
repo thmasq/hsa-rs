@@ -1,4 +1,5 @@
 use hsa_rs::kfd::device::KfdDevice;
+use hsa_rs::kfd::ioctl::{GetProcessAperturesNewArgs, ProcessDeviceApertures};
 use hsa_rs::kfd::sysfs::HsaNodeProperties;
 use hsa_rs::thunk::events::{EventManager, HsaEventDescriptor, HsaEventType, HsaSyncVar};
 use hsa_rs::thunk::memory::MemoryManager;
@@ -18,17 +19,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .read(true)
         .write(true)
         .open("/dev/dri/renderD128")
-        .expect("Failed to open /dev/dri/renderD128. Ensure your user is in the 'render' or 'video' group.");
+        .expect("Failed to open /dev/dri/renderD128");
     let drm_fd = drm_file.as_raw_fd();
     println!("[+] Opened DRM render node");
 
-    // 3. Load Topology (Simulated)
+    // 3. Load Topology & Find GPU
+    let num_devices = 8;
+    let mut apertures = vec![ProcessDeviceApertures::default(); num_devices];
+    let mut args = GetProcessAperturesNewArgs {
+        kfd_process_device_apertures_ptr: apertures.as_mut_ptr() as u64,
+        num_of_nodes: num_devices as u32,
+        pad: 0,
+    };
+
+    device
+        .get_process_apertures_new(&mut args)
+        .map_err(|e| format!("Failed to get apertures: {}", e))?;
+
+    let gpu_id = apertures
+        .iter()
+        .map(|ap| ap.gpu_id)
+        .find(|&id| id != 0)
+        .expect("No KFD-managed GPUs found on this system!");
+
+    println!("[+] Found GPU ID: {}", gpu_id);
+
+    device
+        .acquire_vm(gpu_id, drm_fd as u32)
+        .map_err(|e| format!("Failed to acquire VM: {}", e))?;
+    println!("[+] Acquired VM for GPU {}", gpu_id);
+
+    // Create the node property with the REAL ID
     let mut mock_node = HsaNodeProperties::default();
-    mock_node.kfd_gpu_id = 0x1234; // Arbitrary non-zero ID
+    mock_node.kfd_gpu_id = gpu_id;
+
+    // Node 0 is usually CPU, Node 1 is our detected GPU
     let nodes = vec![HsaNodeProperties::default(), mock_node];
 
     // 4. Initialize Managers
-    // map_err is used here to convert the i32 error code into a generic Box<dyn Error>
     let mut memory_manager = MemoryManager::new(&device, &nodes)
         .map_err(|e| format!("Failed to init Memory Manager: {}", e))?;
     let mut event_manager = EventManager::new(&nodes);
