@@ -369,7 +369,7 @@ impl MemoryManager {
         };
 
         match device.alloc_memory_of_gpu(&mut args) {
-            Ok(_) => {}
+            Ok(()) => {}
             Err(e) => {
                 eprintln!("KFD Alloc Failed: {e:?}");
                 self.free_va_from_flags(va_addr, size, &flags, node_id);
