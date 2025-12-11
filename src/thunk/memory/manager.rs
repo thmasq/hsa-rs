@@ -14,6 +14,7 @@ use crate::thunk::memory::aperture::Aperture;
 use crate::thunk::memory::{Allocation, ApertureAllocator};
 use crate::thunk::queues::builder::MemoryManager as BuilderMemoryManager;
 use std::collections::HashMap;
+use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
 
@@ -203,8 +204,8 @@ impl MemoryManager {
         align: usize,
         vram: bool,
         public: bool,
-        // Optional parameters usually passed via flags in C
         node_id: u32,
+        drm_fd: std::os::unix::io::RawFd,
     ) -> Result<Allocation, i32> {
         // Construct standard flags based on params
         let mut flags = AllocFlags::default();
@@ -215,7 +216,7 @@ impl MemoryManager {
         flags.coherent = !vram; // GTT coherent by default
         flags.no_substitute = vram && !public; // Private VRAM shouldn't fallback easily
 
-        self.allocate_memory_flags(device, node_id, size, align, flags)
+        self.allocate_memory_flags(device, node_id, size, align, flags, drm_fd) // Pass it down
     }
 
     /// Full allocation function with explicit flags
@@ -226,6 +227,7 @@ impl MemoryManager {
         size: usize,
         align: usize,
         flags: AllocFlags,
+        drm_fd: std::os::unix::io::RawFd,
     ) -> Result<Allocation, i32> {
         let size = if size == 0 { 4096 } else { size };
 
@@ -330,17 +332,38 @@ impl MemoryManager {
             // MAP_FIXED is critical for SVM: It ensures the CPU address matches the VA we reserved.
             let mmap_flags = libc::MAP_SHARED | libc::MAP_FIXED;
 
+            let mmap_fd = if flags.doorbell {
+                device.file.as_raw_fd()
+            } else {
+                drm_fd
+            };
+
             unsafe {
                 let ret = libc::mmap(
                     va_addr as *mut libc::c_void,
                     size,
                     prot,
                     mmap_flags,
-                    device.file.as_raw_fd(),
+                    mmap_fd,
                     args.mmap_offset as libc::off_t,
                 );
 
                 if ret == libc::MAP_FAILED {
+                    let err = std::io::Error::last_os_error();
+                    eprintln!("========================================");
+                    eprintln!("[!] MMAP FAILED");
+                    eprintln!("    VA Addr:     0x{:x}", va_addr);
+                    eprintln!("    Size:        {}", size);
+                    eprintln!("    FD:          {}", device.file.as_raw_fd());
+                    eprintln!(
+                        "    Offset:      0x{:x} (Returned by KFD)",
+                        args.mmap_offset
+                    );
+                    eprintln!("    Prot:        0x{:x}", prot);
+                    eprintln!("    Flags:       0x{:x}", mmap_flags);
+                    eprintln!("    OS Error:    {} (Code: {:?})", err, err.raw_os_error());
+                    eprintln!("========================================");
+
                     eprintln!("mmap failed for VA 0x{:x}", va_addr);
                     // Cleanup
                     let mut unmap_args = UnmapMemoryFromGpuArgs {
@@ -506,6 +529,7 @@ impl BuilderMemoryManager for MemoryManager {
         align: usize,
         vram: bool,
         public: bool,
+        drm_fd: RawFd,
     ) -> Result<Allocation, i32> {
         // Forward to the inherent method
         // We assume node_id 0 for simple single-GPU cases, or you can expand QueueBuilder
@@ -521,7 +545,7 @@ impl BuilderMemoryManager for MemoryManager {
         // Let's use the first available GPU node from our map for now.
         let node_id = *self.node_to_gpu_id.keys().next().unwrap_or(&0);
 
-        self.allocate_gpu_memory(device, size, align, vram, public, node_id)
+        self.allocate_gpu_memory(device, size, align, vram, public, node_id, drm_fd)
     }
 
     fn free_gpu_memory(&mut self, device: &KfdDevice, alloc: &Allocation) {

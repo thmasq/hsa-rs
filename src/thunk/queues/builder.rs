@@ -6,6 +6,7 @@ use crate::kfd::ioctl::{
 use crate::kfd::sysfs::HsaNodeProperties;
 use crate::thunk::memory::Allocation;
 use crate::thunk::queues::cwsr;
+use std::os::fd::RawFd;
 use std::ptr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,7 @@ pub trait MemoryManager {
         align: usize,
         vram: bool,
         public: bool,
+        drm_fd: RawFd,
     ) -> Result<Allocation, i32>;
 
     /// Free allocated memory
@@ -87,6 +89,7 @@ pub struct QueueBuilder<'a> {
 
     // Inputs
     node_id: u32,
+    drm_fd: RawFd,
     queue_type: QueueType,
     percentage: u32,
     priority: QueuePriority,
@@ -101,6 +104,7 @@ impl<'a> QueueBuilder<'a> {
         mem_mgr: &'a mut dyn MemoryManager,
         node_props: &'a HsaNodeProperties,
         node_id: u32,
+        drm_fd: RawFd,
         ring_base: u64,
         ring_size: u64,
     ) -> Self {
@@ -109,6 +113,7 @@ impl<'a> QueueBuilder<'a> {
             mem_mgr,
             node_props,
             node_id,
+            drm_fd,
             ring_base,
             ring_size,
             queue_type: QueueType::Compute,
@@ -154,7 +159,7 @@ impl<'a> QueueBuilder<'a> {
             // Pass self.device to the allocator
             let alloc = self
                 .mem_mgr
-                .allocate_gpu_memory(self.device, eop_size, 4096, true, false)
+                .allocate_gpu_memory(self.device, eop_size, 4096, true, false, self.drm_fd)
                 .map_err(|e| {
                     eprintln!("Failed to allocate EOP");
                     e
@@ -180,6 +185,7 @@ impl<'a> QueueBuilder<'a> {
                         4096,
                         false,
                         false,
+                        self.drm_fd,
                     )
                     .map_err(|e| {
                         eprintln!("Failed to allocate CWSR");

@@ -78,6 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             false, // VRAM = false (Use GTT/System)
             true,  // Public = true (Host Accessible)
             gpu_idx as u32,
+            drm_file.as_raw_fd(),
         )
         .map_err(|e| format!("Ring buffer allocation failed (Err: {})", e))?;
 
@@ -92,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut mem_mgr,
         &gpu_node.properties,
         gpu_idx as u32,
+        drm_file.as_raw_fd(),
         ring_mem.gpu_va,
         ring_size as u64,
     )
