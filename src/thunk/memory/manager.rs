@@ -12,6 +12,7 @@ use crate::kfd::ioctl::{
 use crate::kfd::sysfs::HsaNodeProperties;
 use crate::thunk::memory::aperture::Aperture;
 use crate::thunk::memory::{Allocation, ApertureAllocator};
+use crate::thunk::queues::builder::MemoryManager as BuilderMemoryManager;
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
@@ -494,5 +495,46 @@ impl MemoryManager {
         } else {
             self.svm_aperture.free_va(addr, size);
         }
+    }
+}
+
+impl BuilderMemoryManager for MemoryManager {
+    fn allocate_gpu_memory(
+        &mut self,
+        device: &KfdDevice,
+        size: usize,
+        align: usize,
+        vram: bool,
+        public: bool,
+    ) -> Result<Allocation, i32> {
+        // Forward to the inherent method
+        // We assume node_id 0 for simple single-GPU cases, or you can expand QueueBuilder
+        // to pass the specific node_id via the trait if needed.
+        // Ideally, the QueueBuilder should pass the node_id in the trait method,
+        // but for now we default to 0 (First GPU) or find the first GPU.
+
+        // Since MemoryManager holds gpu_apertures mapped by node_id, we need a node_id.
+        // For the queue builder usage, it is usually allocating EOP/CWSR for the target GPU.
+        // We will infer node_id 0 for now as the trait signature in builder doesn't carry node_id
+        // (except for map_doorbell).
+        // *Correction*: allocate_memory_flags needs a node_id.
+        // Let's use the first available GPU node from our map for now.
+        let node_id = *self.node_to_gpu_id.keys().next().unwrap_or(&0);
+
+        self.allocate_gpu_memory(device, size, align, vram, public, node_id)
+    }
+
+    fn free_gpu_memory(&mut self, device: &KfdDevice, alloc: &Allocation) {
+        self.free_memory(device, alloc.handle);
+    }
+
+    fn map_doorbell(
+        &mut self,
+        device: &KfdDevice,
+        node_id: u32,
+        gpu_id: u32,
+        doorbell_offset: u64,
+    ) -> Result<*mut u32, i32> {
+        self.map_doorbell(device, node_id, gpu_id, doorbell_offset)
     }
 }

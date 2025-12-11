@@ -4,6 +4,7 @@ use crate::kfd::ioctl::{
     KFD_IOC_QUEUE_TYPE_SDMA, KFD_IOC_QUEUE_TYPE_SDMA_XGMI,
 };
 use crate::kfd::sysfs::HsaNodeProperties;
+use crate::thunk::memory::Allocation;
 use crate::thunk::queues::cwsr;
 use std::ptr;
 
@@ -54,31 +55,25 @@ pub struct KmtQueue {
     pub use_ats: bool,
 }
 
-/// Simple abstraction for memory allocations (VRAM/GTT/Doorbell)
-/// In the final implementation, this will call `fmm::allocate_device`.
-pub struct Allocation {
-    pub ptr: *mut u8,
-    pub size: usize,
-    pub gpu_va: u64, // Virtual Address visible to GPU
-    pub handle: u64, // KFD handle
-    pub is_userptr: bool,
-}
-
 /// Abstraction for the Flat Memory Model manager needed by the builder.
 pub trait MemoryManager {
     /// Allocate GPU accessible memory (GTT or VRAM)
     fn allocate_gpu_memory(
         &mut self,
+        device: &KfdDevice,
         size: usize,
         align: usize,
         vram: bool,
         public: bool,
     ) -> Result<Allocation, i32>;
+
     /// Free allocated memory
-    fn free_gpu_memory(&mut self, alloc: Allocation);
+    fn free_gpu_memory(&mut self, device: &KfdDevice, alloc: &Allocation);
+
     /// Map a doorbell index to a CPU virtual address
     fn map_doorbell(
         &mut self,
+        device: &KfdDevice,
         node_id: u32,
         gpu_id: u32,
         doorbell_offset: u64,
@@ -156,9 +151,10 @@ impl<'a> QueueBuilder<'a> {
         let eop_size = self.calculate_eop_size(q.gfx_version, is_compute);
 
         if eop_size > 0 {
+            // Pass self.device to the allocator
             let alloc = self
                 .mem_mgr
-                .allocate_gpu_memory(eop_size, 4096, true, false)
+                .allocate_gpu_memory(self.device, eop_size, 4096, true, false)
                 .map_err(|e| {
                     eprintln!("Failed to allocate EOP");
                     e
@@ -179,9 +175,10 @@ impl<'a> QueueBuilder<'a> {
                 let alloc = self
                     .mem_mgr
                     .allocate_gpu_memory(
+                        self.device,
                         sizes.total_mem_alloc_size as usize,
-                        4096,  // Page aligned
-                        false, // GTT (System memory)
+                        4096,
+                        false,
                         false,
                     )
                     .map_err(|e| {
@@ -251,10 +248,7 @@ impl<'a> QueueBuilder<'a> {
 
         q.queue_id = args.queue_id;
 
-        // 6. Map Doorbell
-        // On SOC15, args.doorbell_offset contains the Page Offset + Index.
-        // We need to decode this to get the exact mmap offset and pointer.
-
+        // Pass self.device to map_doorbell
         let doorbell_ptr = self.resolve_doorbell_ptr(args.doorbell_offset, q.gfx_version)?;
 
         // 7. Construct Result
@@ -334,9 +328,12 @@ impl<'a> QueueBuilder<'a> {
             ptr_offset = kernel_offset & mask;
         }
 
-        let base_ptr =
-            self.mem_mgr
-                .map_doorbell(self.node_id, self.node_props.kfd_gpu_id, mmap_offset)?;
+        let base_ptr = self.mem_mgr.map_doorbell(
+            self.device,
+            self.node_id,
+            self.node_props.kfd_gpu_id,
+            mmap_offset,
+        )?;
 
         unsafe {
             // base_ptr is u32*, need to add byte offset
