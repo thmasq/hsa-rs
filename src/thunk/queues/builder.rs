@@ -49,6 +49,7 @@ pub struct KmtQueue {
     pub eop_mem: Option<Allocation>,
     pub cwsr_mem: Option<Allocation>,
     pub queue_mem: Option<Allocation>,
+    pub ptr_mem: Option<Allocation>,
 
     // Properties
     pub gfx_version: u32,
@@ -79,6 +80,7 @@ pub trait MemoryManager {
         node_id: u32,
         gpu_id: u32,
         doorbell_offset: u64,
+        size: u64,
     ) -> Result<*mut u32, i32>;
 }
 
@@ -142,6 +144,7 @@ impl<'a> QueueBuilder<'a> {
             eop_mem: None,
             cwsr_mem: None,
             queue_mem: None,
+            ptr_mem: None,
             gfx_version: self.node_props.gfx_target_version,
             cwsr_sizes: None,
             use_ats: false, // TODO: Check capability.HSAMMUPresent logic if needed
@@ -166,6 +169,7 @@ impl<'a> QueueBuilder<'a> {
             );
 
             if alloc_res.is_err() {
+                println!("[WARN] EOP VRAM allocation failed, falling back to GTT");
                 alloc_res = self.mem_mgr.allocate_gpu_memory(
                     self.device,
                     eop_size,
@@ -224,6 +228,24 @@ impl<'a> QueueBuilder<'a> {
             }
         }
 
+        let ptr_alloc = self
+            .mem_mgr
+            .allocate_gpu_memory(self.device, 4096, 4096, false, true, self.drm_fd)
+            .map_err(|e| {
+                eprintln!("Failed to allocate queue pointers");
+                e
+            })?;
+
+        // Zero initialize pointers
+        unsafe {
+            ptr::write_bytes(ptr_alloc.ptr, 0, 4096);
+        }
+
+        let rptr_va = ptr_alloc.gpu_va;
+        let wptr_va = ptr_alloc.gpu_va + 8;
+
+        q.ptr_mem = Some(ptr_alloc);
+
         // 4. Setup IOCTL Arguments
         let mut args = CreateQueueArgs::default();
         args.gpu_id = self.node_props.kfd_gpu_id;
@@ -246,9 +268,8 @@ impl<'a> QueueBuilder<'a> {
             args.read_pointer_address = 0;
             args.write_pointer_address = 0;
         } else {
-            // For PM4, we use the host-allocated rptr/wptr in our KmtQueue struct.
-            args.read_pointer_address = &q.rptr as *const _ as u64;
-            args.write_pointer_address = &q.wptr as *const _ as u64;
+            args.read_pointer_address = rptr_va;
+            args.write_pointer_address = wptr_va;
         }
 
         // EOP & CWSR Args
@@ -281,8 +302,8 @@ impl<'a> QueueBuilder<'a> {
         let resource = QueueResource {
             queue_id: args.queue_id,
             queue_doorbell: doorbell_ptr as u64,
-            queue_read_ptr: args.read_pointer_address,
-            queue_write_ptr: args.write_pointer_address,
+            queue_read_ptr: rptr_va,
+            queue_write_ptr: wptr_va,
             queue_err_reason: 0, // Not implemented yet
             internal_handle: q_handle,
         };
@@ -355,6 +376,7 @@ impl<'a> QueueBuilder<'a> {
             self.node_id,
             self.node_props.kfd_gpu_id,
             mmap_offset,
+            doorbell_page_size as u64,
         )?;
 
         unsafe {

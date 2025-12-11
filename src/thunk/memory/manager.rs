@@ -386,17 +386,18 @@ impl MemoryManager {
         node_id: u32,
         gpu_id: u32,
         doorbell_offset: u64,
+        size: u64,
     ) -> Result<*mut u32, i32> {
-        let size = 4096; // Doorbells are always one page
+        let size = size as usize;
 
         // 1. Allocate VA from Alt Aperture (Uncached/Fine Grain)
+        // Ensure alignment matches the size (usually page aligned)
         let va_addr = self.svm_alt_aperture.allocate_va(size, 4096).ok_or(-12)?;
 
         // 2. KFD Alloc (Doorbell)
-        // Doorbells are special: they don't allocate VRAM/GTT, they map a hardware BAR.
+        // flags: DOORBELL | WRITABLE | COHERENT | NO_SUBSTITUTE
         let flags = KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL
             | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
-            | KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
             | KFD_IOC_ALLOC_MEM_FLAGS_COHERENT
             | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
 
@@ -404,12 +405,13 @@ impl MemoryManager {
             va_addr,
             size: size as u64,
             handle: 0,
-            mmap_offset: doorbell_offset, // Important: Input offset for doorbell creation
+            mmap_offset: 0,
             gpu_id,
             flags,
         };
 
-        if let Err(_) = device.alloc_memory_of_gpu(&mut args) {
+        if let Err(e) = device.alloc_memory_of_gpu(&mut args) {
+            eprintln!("[ERROR] map_doorbell: KFD Alloc failed: {:?}", e);
             self.svm_alt_aperture.free_va(va_addr, size);
             return Err(-1);
         }
@@ -422,12 +424,16 @@ impl MemoryManager {
                 va_addr as *mut libc::c_void,
                 size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_FIXED, // Force unified address
+                libc::MAP_SHARED | libc::MAP_FIXED,
                 device.file.as_raw_fd(),
-                args.mmap_offset as libc::off_t,
+                doorbell_offset as libc::off_t,
             );
 
             if ret == libc::MAP_FAILED {
+                eprintln!(
+                    "[ERROR] map_doorbell: mmap failed (errno: {})",
+                    std::io::Error::last_os_error()
+                );
                 device.free_memory_of_gpu(args.handle).ok();
                 self.svm_alt_aperture.free_va(va_addr, size);
                 return Err(-1);
@@ -542,7 +548,8 @@ impl BuilderMemoryManager for MemoryManager {
         node_id: u32,
         gpu_id: u32,
         doorbell_offset: u64,
+        size: u64,
     ) -> Result<*mut u32, i32> {
-        self.map_doorbell(device, node_id, gpu_id, doorbell_offset)
+        self.map_doorbell(device, node_id, gpu_id, doorbell_offset, size)
     }
 }
