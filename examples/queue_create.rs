@@ -2,6 +2,8 @@ use hsa_rs::kfd::device::KfdDevice;
 use hsa_rs::kfd::sysfs::Topology;
 use hsa_rs::thunk::memory::MemoryManager;
 use hsa_rs::thunk::queues::builder::{QueueBuilder, QueuePriority, QueueType};
+use std::fs::File;
+use std::os::unix::io::AsRawFd;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================================================");
@@ -47,6 +49,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("[+] Selected Node {} (GPU ID: {})", gpu_idx, gpu_id);
     println!("    Name: {}", gpu_node.properties.marketing_name);
+
+    let drm_minor = gpu_node.properties.drm_render_minor;
+    if drm_minor < 0 {
+        return Err("Invalid DRM render minor number".into());
+    }
+
+    let drm_path = format!("/dev/dri/renderD{}", drm_minor);
+    println!("[+] Opening DRM Device: {}", drm_path);
+
+    let drm_file =
+        File::open(&drm_path).map_err(|e| format!("Failed to open {}: {}", drm_path, e))?;
+
+    println!("[+] Acquiring VM...");
+    device.acquire_vm(gpu_id, drm_file.as_raw_fd() as u32)?;
 
     // 5. Allocate Ring Buffer
     // The Thunk QueueBuilder expects us to provide the memory for the ring itself.
