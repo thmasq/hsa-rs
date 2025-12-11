@@ -9,3 +9,8 @@ libc = "0.2.178"
 [[example]]
 name = "print_diagnostics"
 path = "examples/print_diagnostics.rs"
+
+[[example]]
+name = "queue_create"
+path = "examples/queue_create.rs"
+

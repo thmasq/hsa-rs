@@ -28,6 +28,7 @@ use crate::kfd::ioctl::{
 };
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
 
 /// A handle to the KFD driver character device (`/dev/kfd`).
@@ -35,7 +36,7 @@ use std::os::unix::io::AsRawFd;
 /// This struct provides methods to issue IOCTLs to the kernel driver.
 /// Most methods correspond 1:1 with KFD IOCTL definitions.
 pub struct KfdDevice {
-    file: File,
+    pub file: File,
 }
 
 impl KfdDevice {
@@ -359,5 +360,11 @@ impl KfdDevice {
     /// AMD Infinity Storage (AIS) operations.
     pub fn ais_op(&self, args: &mut AisArgs) -> io::Result<()> {
         unsafe { self.ioctl(AMDKFD_IOC_AIS_OP, args) }
+    }
+}
+
+impl AsRawFd for KfdDevice {
+    fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
     }
 }
