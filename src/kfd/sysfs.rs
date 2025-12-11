@@ -1410,12 +1410,30 @@ fn get_pci_revision_id(domain: u32, location_id: u32) -> Option<u32> {
 
 // Logic to emulate hsakmt_get_vgpr_size_per_cu based on GFX version
 const fn get_vgpr_size_per_cu(major: u32, minor: u32, stepping: u32) -> u32 {
-    let full = (major << 16) | (minor << 8) | stepping;
-    if full >= 0x000A_0000 {
-        262_144
-    } else {
-        262_144
+    // Combine into GFX version integer (e.g., 90010 for 9.0.10)
+    // Note: The shifting logic here (major << 16) is different from how
+    // ROCm usually represents it (decimal: 90010).
+    // It's safer to use the logic you already wrote in cwsr.rs.
+
+    // Check for "Large VGPR" GFX9 devices (Aldebaran, Arcturus, MI300)
+    #[rustfmt::skip]
+    let is_large_vgpr_gfx9 = major == 9
+        && (
+            (minor == 0 && stepping == 8) ||    // Arcturus
+            (minor == 4) ||                 // Aldebaran (9.4.2) & Aqua Vanjaram family
+            (minor == 5 && stepping == 0)       // GFX950
+        );
+
+    if is_large_vgpr_gfx9 {
+        return 524_288; // 512 KB
     }
+
+    if major >= 11 {
+        return 393_216; // 384 KB (RDNA3+)
+    }
+
+    // Default for GFX8, GFX9 (Vega), GFX10 (RDNA1/2)
+    262_144 // 256 KB
 }
 
 // ===============================================================================================
@@ -1708,10 +1726,12 @@ impl Topology {
         // 3. Lookup Marketing Name (amdgpu.ids)
         // KFD doesn't explicitly expose revision_id in the properties file,
         // so we must look it up via PCI sysfs using location_id/domain.
-        let mut marketing_name = None;
-        if let Some(rev_id) = get_pci_revision_id(props.domain, props.location_id) {
-            marketing_name = lookup_marketing_name_from_file(props.device_id, rev_id);
-        }
+        let marketing_name =
+            if let Some(rev_id) = get_pci_revision_id(props.domain, props.location_id) {
+                lookup_marketing_name_from_file(props.device_id, rev_id)
+            } else {
+                None
+            };
 
         if let Some(name) = marketing_name {
             props.marketing_name = name;

@@ -10,9 +10,8 @@ use crate::kfd::ioctl::{
 use crate::kfd::sysfs::HsaNodeProperties;
 use crate::thunk::memory::{Allocation, MemoryManager};
 use std::collections::HashMap;
-use std::mem;
 use std::os::fd::RawFd;
-use std::ptr;
+use std::{mem, ptr};
 
 /// The hardware limit for signal events per process.
 pub const KFD_SIGNAL_EVENT_LIMIT: usize = 4096;
@@ -80,6 +79,7 @@ pub struct HsaMemoryAccessFault {
     pub is_fatal: bool,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy)]
 pub struct HsaAccessAttributeFailure {
     pub not_present: bool,
@@ -108,9 +108,15 @@ pub struct HsaEvent {
     pub event_id: u32,
     pub event_type: HsaEventType,
     pub payload: HsaEventDataPayload,
-    pub hw_data1: u64,
-    pub hw_data2: u64,
-    pub hw_data3: u32,
+
+    // Internal hardware data exposed for debugging or IPC
+    pub hw_data1: u64, // OsEventHandle
+    pub hw_data2: u64, // HWAddress (pointer into events page)
+    pub hw_data3: u32, // HWData (trigger data)
+
+    // State tracking
+    /// The last known "age" (counter) of this event from the kernel.
+    /// If the kernel reports an age > this value, the event has fired.
     pub last_event_age: u64,
 }
 
@@ -158,12 +164,15 @@ impl EventManager {
         manual_reset: bool,
         is_signaled: bool,
     ) -> Result<HsaEvent, i32> {
-        let mut args = CreateEventArgs::default();
-        args.event_type = desc.event_type as u32;
-        args.node_id = desc.node_id;
-        args.auto_reset = u32::from(!manual_reset);
+        let mut args = CreateEventArgs {
+            event_type: desc.event_type as u32,
+            node_id: desc.node_id,
+            auto_reset: u32::from(!manual_reset),
+            ..Default::default()
+        };
 
-        // 1. Ensure Events Page exists.
+        // 1. Ensure Events Page exists if not already allocated.
+        // The events page is an array of 64-bit slots (8 bytes) * KFD_SIGNAL_EVENT_LIMIT.
         if self.events_page.is_none() {
             let alloc_size = KFD_SIGNAL_EVENT_LIMIT * 8;
 
@@ -198,13 +207,15 @@ impl EventManager {
         // 4. Calculate HW Address
         // The HW address is the CPU-mapped pointer to the specific slot in the events page.
         // This allows userspace to poll the event slot directly if needed.
-        let mut hw_data2 = 0;
-        if let Some(alloc) = &self.events_page
+        let hw_data2 = if let Some(alloc) = &self.events_page
             && args.event_slot_index < KFD_SIGNAL_EVENT_LIMIT as u32
         {
+            // Pointer arithmetic: base_ptr + (slot_index * 8 bytes)
             let base = alloc.ptr as u64;
-            hw_data2 = base + (u64::from(args.event_slot_index) * 8);
-        }
+            base + (u64::from(args.event_slot_index) * 8)
+        } else {
+            0
+        };
 
         let event = HsaEvent {
             event_id: args.event_id,
@@ -224,6 +235,7 @@ impl EventManager {
                 pad: 0,
             };
             if unsafe { device.ioctl(AMDKFD_IOC_SET_EVENT, &mut set_args) }.is_err() {
+                // If setting the initial state fails, we must destroy the event to avoid leaking.
                 self.destroy_event(device, &event).ok();
                 return Err(-1);
             }
