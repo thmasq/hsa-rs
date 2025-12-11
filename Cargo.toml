@@ -17,3 +17,7 @@ path = "examples/queue_create.rs"
 [[example]]
 name = "event_test"
 path = "examples/event_test.rs"
+
+[[example]]
+name = "extended_diagnostics"
+path = "examples/extended_diagnostics.rs"

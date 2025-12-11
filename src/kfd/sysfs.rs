@@ -2059,7 +2059,7 @@ impl Node {
                 match k {
                     "processor_id_low" => p.processor_id_low = val,
                     "level" => p.cache_level = val,
-                    "size" => p.cache_size = val,
+                    "size" => p.cache_size = val * 1024,
                     "cache_line_size" => p.cache_line_size = val,
                     "cache_lines_per_tag" => p.cache_lines_per_tag = val,
                     "association" => p.cache_associativity = val,
