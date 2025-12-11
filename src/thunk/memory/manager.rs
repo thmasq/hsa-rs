@@ -349,22 +349,6 @@ impl MemoryManager {
                 );
 
                 if ret == libc::MAP_FAILED {
-                    let err = std::io::Error::last_os_error();
-                    eprintln!("========================================");
-                    eprintln!("[!] MMAP FAILED");
-                    eprintln!("    VA Addr:     0x{:x}", va_addr);
-                    eprintln!("    Size:        {}", size);
-                    eprintln!("    FD:          {}", device.file.as_raw_fd());
-                    eprintln!(
-                        "    Offset:      0x{:x} (Returned by KFD)",
-                        args.mmap_offset
-                    );
-                    eprintln!("    Prot:        0x{:x}", prot);
-                    eprintln!("    Flags:       0x{:x}", mmap_flags);
-                    eprintln!("    OS Error:    {} (Code: {:?})", err, err.raw_os_error());
-                    eprintln!("========================================");
-
-                    eprintln!("mmap failed for VA 0x{:x}", va_addr);
                     // Cleanup
                     let mut unmap_args = UnmapMemoryFromGpuArgs {
                         handle: args.handle,
