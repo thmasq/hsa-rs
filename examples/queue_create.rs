@@ -69,8 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Allocate Ring Buffer
     // The Thunk QueueBuilder expects us to provide the memory for the ring itself.
-    // We allocate 64KB in GTT (System Memory) which is host accessible.
-    // We use the new `allocate_gtt` utility method.
+    // We allocate 64KB in GTT (System Memory), which is accessible by both Host and Device.
     let ring_size = 64 * 1024;
     println!("[+] Allocating {} KB Ring Buffer...", ring_size / 1024);
 
@@ -117,25 +116,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 8. Cleanup
     println!("\n[+] cleaning up resources...");
 
-    // Destroy KFD Queue
-    device.destroy_queue(queue.queue_id)?;
-    println!("    Queue destroyed");
+    // The HsaQueue struct now implements Drop.
+    // When `queue` goes out of scope here (or is dropped explicitly), it will:
+    // 1. Destroy the KFD Queue
+    // 2. Free the internal EOP and CWSR buffers
+    drop(queue);
+    println!("    Queue destroyed and internal resources freed");
 
     // Free the Ring Buffer
+    // This was allocated manually by us via mem_mgr, so we must free it manually.
     mem_mgr.free_memory(&device, ring_mem.handle);
     println!("    Ring buffer freed");
-
-    // Free the internal Queue Resources (CWSR area, EOP buffer)
-    // The `queue` object holds a raw pointer to the `KmtQueue` struct allocated by the builder.
-    // We convert it back to a Box to let Rust drop it and free the tracking memory.
-    // The `KmtQueue` destructor (if we implemented Drop) would handle freeing EOP/CWSR allocations via mem_mgr.
-    // Since we haven't implemented automatic Drop glue yet, we manually cleanup here if needed,
-    // or just let the process exit (which cleans up KFD resources automatically).
-    unsafe {
-        let _queue_tracker = Box::from_raw(queue.internal_handle);
-        // In a full implementation, `KmtQueue` would implement Drop to call free_memory on eop_mem/cwsr_mem.
-    }
-    println!("    Internal resources freed");
 
     Ok(())
 }

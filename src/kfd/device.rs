@@ -30,13 +30,16 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
 
 /// A handle to the KFD driver character device (`/dev/kfd`).
 ///
 /// This struct provides methods to issue IOCTLs to the kernel driver.
-/// Most methods correspond 1:1 with KFD IOCTL definitions.
+/// It wraps the file descriptor in an `Arc`, so it is cheap to clone and share
+/// across objects (like Queues or Events) that need to persist beyond the initial context.
+#[derive(Clone, Debug)]
 pub struct KfdDevice {
-    pub file: File,
+    pub file: Arc<File>,
 }
 
 impl KfdDevice {
@@ -47,7 +50,9 @@ impl KfdDevice {
     pub fn open() -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open("/dev/kfd")?;
 
-        Ok(Self { file })
+        Ok(Self {
+            file: Arc::new(file),
+        })
     }
 
     /// Generic unsafe helper to execute an IOCTL.
