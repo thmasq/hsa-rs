@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 use std::env;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
 const KFD_SYSFS_PATH: &str = "/sys/devices/virtual/kfd/kfd/topology";
+const AMDGPU_IDS_PATHS: &[&str] = &[
+    "/usr/share/libdrm/amdgpu.ids",
+    "/usr/local/share/libdrm/amdgpu.ids",
+];
 
 // ===============================================================================================
 // Constants & Lookups
@@ -1316,8 +1320,7 @@ const GFXIP_LOOKUP_TABLE: &[GfxIpLookup] = &[
 ];
 
 fn find_gfx_ip(device_id: u16, major_version: u8) -> Option<&'static GfxIpLookup> {
-    // Sanity check matching C code logic
-    if major_version > 12 {
+    if major_version > 14 {
         return None;
     }
     GFXIP_LOOKUP_TABLE
@@ -1325,19 +1328,86 @@ fn find_gfx_ip(device_id: u16, major_version: u8) -> Option<&'static GfxIpLookup
         .find(|entry| entry.device_id == device_id)
 }
 
+/// Helper to parse the amdgpu.ids file from libdrm
+fn lookup_marketing_name_from_file(device_id: u32, revision_id: u32) -> Option<String> {
+    for path_str in AMDGPU_IDS_PATHS {
+        let path = Path::new(path_str);
+        if !path.exists() {
+            continue;
+        }
+
+        if let Ok(file) = File::open(path) {
+            let reader = BufReader::new(file);
+            for line in reader.lines().map_while(Result::ok) {
+                let line = line.trim();
+                // Skip comments and empty lines
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+
+                // Parse: device_id, revision_id, product_name
+                // Example: 1114,    C2,    AMD Radeon 860M Graphics
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.len() < 3 {
+                    continue;
+                }
+
+                let file_did_str = parts[0].trim();
+                let file_rid_str = parts[1].trim();
+                let product_name = parts[2].trim().to_string();
+
+                if let Ok(file_did) = u32::from_str_radix(file_did_str, 16) {
+                    if file_did == device_id {
+                        // Check Revision:
+                        // Some entries might use wildcards or specific revisions.
+                        // Ideally we match the exact revision if possible.
+                        // However, the file format is strictly "device, rev, name".
+
+                        // If rev is not a valid hex, ignore this line (e.g. version header "1.0.0")
+                        if let Ok(file_rid) = u32::from_str_radix(file_rid_str, 16) {
+                            if file_rid == revision_id {
+                                return Some(product_name);
+                            }
+                        } else {
+                            // If revision parses as non-hex (unlikely in valid lines), ignore.
+                            // Note: Some legacy formats might have different rules,
+                            // but modern amdgpu.ids is strictly hex.
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Helper to find the PCI Revision ID for a given KFD node
+/// KFD provides Location ID (BDF) and Domain. We can look up /sys/bus/pci/devices.
+fn get_pci_revision_id(domain: u32, location_id: u32) -> Option<u32> {
+    // Location ID in KFD is typically (Bus << 8) | (Device << 3) | Function
+    let bus = (location_id >> 8) & 0xFF;
+    let dev = (location_id >> 3) & 0x1F;
+    let func = location_id & 0x07;
+
+    let pci_path = format!(
+        "/sys/bus/pci/devices/{:04x}:{:02x}:{:02x}.{:01x}/revision",
+        domain, bus, dev, func
+    );
+
+    if let Ok(content) = fs::read_to_string(&pci_path) {
+        let content = content.trim();
+        // The revision file usually contains a hex string like "0xc2" or "0x00"
+        let clean_content = content.strip_prefix("0x").unwrap_or(content);
+        return u32::from_str_radix(clean_content, 16).ok();
+    }
+
+    None
+}
+
 // Logic to emulate hsakmt_get_vgpr_size_per_cu based on GFX version
 fn get_vgpr_size_per_cu(major: u32, minor: u32, stepping: u32) -> u32 {
     let full = (major << 16) | (minor << 8) | stepping;
-    // Values derived from standard GCN/RDNA architectures
-    if full >= 0x0A0000 {
-        // GFX10+ (RDNA)
-        // 32KB VGPRs per SIMD * 2 SIMDs per CU = 64KB?
-        // Or 64KB physical file? ROCR runtime logic usually:
-        262144 // 256KB Total Vector Register File per CU?
-    } else {
-        // GFX9 (Vega) and older: 64KB per SIMD * 4 SIMDs = 256KB
-        262144
-    }
+    if full >= 0x0A0000 { 262144 } else { 262144 }
 }
 
 // ===============================================================================================
@@ -1572,15 +1642,13 @@ impl Topology {
         })
     }
 
-    /// Port of `topology_sysfs_get_node_props` logic for properties not found in sysfs.
     fn enrich_gpu_properties(props: &mut HsaNodeProperties) {
         // Bail out if CPU node
         if props.simd_count == 0 {
             return;
         }
 
-        // 1. Decode GFX Target Version (default)
-        // KFD reported: 100300 -> 10.3.0
+        // 1. Decode GFX Target Version
         let mut major = (props.gfx_target_version / 10000) % 100;
         let mut minor = (props.gfx_target_version / 100) % 100;
         let mut step = props.gfx_target_version % 100;
@@ -1613,7 +1681,8 @@ impl Topology {
             stepping: step,
         };
 
-        // 4. Lookup Marketing Name / AMD Name in table
+        // 2. Lookup Architecture Name (Internal Table)
+        // This is still useful for tools that need the ASIC family name (e.g. "Navi31")
         if let Some(entry) = find_gfx_ip(props.device_id as u16, major as u8) {
             props.amd_name = entry.name.to_string();
             // If table has stricter versioning, update EngineID
@@ -1625,16 +1694,22 @@ impl Topology {
             props.amd_name = format!("GFX{:02x}", props.gfx_target_version);
         }
 
-        // 5. Marketing Name Fallback
-        if props.marketing_name.is_empty() {
-            // In C this calls DRM. Here we use a generic fallback or the table name.
+        // 3. Lookup Marketing Name (amdgpu.ids)
+        // KFD doesn't explicitly expose revision_id in the properties file,
+        // so we must look it up via PCI sysfs using location_id/domain.
+        let mut marketing_name = None;
+        if let Some(rev_id) = get_pci_revision_id(props.domain, props.location_id) {
+            marketing_name = lookup_marketing_name_from_file(props.device_id, rev_id);
+        }
+
+        if let Some(name) = marketing_name {
+            props.marketing_name = name;
+        } else if props.marketing_name.is_empty() {
             props.marketing_name = props.amd_name.clone();
         }
 
-        // 6. Derived Properties
+        // 4. Derived Properties
         if props.simd_arrays_per_engine != 0 {
-            // C code uses `array_count` (total SIMD arrays) / `simd_arrays_per_engine` (SEs?)
-            // Actually `props->NumArrays` in C struct maps to `simd_arrays_per_engine` in sysfs
             props.num_shader_banks = props.array_count / props.simd_arrays_per_engine;
         }
 
@@ -1645,14 +1720,11 @@ impl Topology {
             props.engine_id.stepping,
         );
 
-        // Fix for missing num_xcc on older kernels
         if props.num_xcc == 0 {
             props.num_xcc = 1;
         }
     }
 
-    /// Port of `get_indirect_iolink_info` from topology.c
-    /// Calculates connections for GPU->CPU->GPU, GPU->CPU->CPU->GPU, etc.
     fn calculate_indirect_link(
         nodes: &[Node],
         src_idx: usize,
@@ -1664,26 +1736,24 @@ impl Topology {
         let src_is_gpu = src.properties.simd_count > 0;
         let dst_is_gpu = dst.properties.simd_count > 0;
 
-        // CPU-CPU links are usually handled by OS/NUMA, KFD only creates GPU links or Indirects
         if !src_is_gpu && !dst_is_gpu {
             return None;
         }
 
-        // Determine the "Direct CPU" for a node.
-        // If node is CPU, it is its own direct CPU.
-        // If node is GPU, find the PCIe/XGMI link to a CPU.
+        if src_is_gpu && !dst_is_gpu {
+            return None;
+        }
+
         let get_direct_cpu = |node: &Node, idx: usize| -> Option<usize> {
             if node.properties.simd_count == 0 {
-                return Some(idx); // Is CPU
+                return Some(idx);
             }
-            // Find link to CPU
             node.io_links
                 .iter()
                 .find(|l| {
                     let is_direct = l.weight <= 20;
                     let valid_type =
                         l.type_ == HSA_IOLINKTYPE_PCIEXPRESS || l.type_ == HSA_IOLINKTYPE_XGMI;
-                    // Check if target is CPU
                     if let Some(target) = nodes.get(l.node_to as usize) {
                         return is_direct && valid_type && target.properties.simd_count == 0;
                     }
@@ -1701,9 +1771,6 @@ impl Topology {
         let mut link_type = HSA_IOLINKTYPE_UNDEFINED;
 
         if cpu_src == cpu_dst {
-            // Case 1: GPU -> CPU -> GPU (or GPU->CPU, CPU->GPU)
-            // Path: Src -> CPU -> Dst
-
             if src_is_gpu {
                 let l = src
                     .io_links
@@ -1713,8 +1780,6 @@ impl Topology {
             }
 
             if dst_is_gpu {
-                // In C code: `get_direct_iolink_info(dir_cpu1, node2...)`
-                // Find link from CPU to Dst.
                 let l = nodes[cpu_src]
                     .io_links
                     .iter()
@@ -1727,9 +1792,6 @@ impl Topology {
                 };
             }
         } else {
-            // Case 2: GPU -> CPU1 -> CPU2 -> GPU (Indirect / QPI)
-            // Path: Src -> CPU1 -> CPU2 -> Dst
-
             if src_is_gpu {
                 let l = src
                     .io_links
@@ -1738,20 +1800,17 @@ impl Topology {
                 weight1 = l.weight;
             }
 
-            // CPU1 -> CPU2
             let l_cpu = nodes[cpu_src]
                 .io_links
                 .iter()
                 .find(|l| l.node_to as usize == cpu_dst)?;
             weight2 = l_cpu.weight;
 
-            // C code check: "On QPI... CPU<->CPU weight > 20 means different sockets... not supported"
             if l_cpu.type_ == HSA_IOLINKTYPE_QPI_1_1 && weight2 > 20 {
                 return None;
             }
 
             if dst_is_gpu {
-                // CPU2 -> Dst
                 let l = nodes[cpu_dst]
                     .io_links
                     .iter()
