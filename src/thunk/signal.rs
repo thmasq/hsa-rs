@@ -12,6 +12,66 @@ use std::time::{Duration, Instant};
 
 pub type HsaSignalValue = i64;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod x86_utils {
+    use std::arch::asm;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// Checks for MWAITX support (CPUID Fn8000_0001_ECX[29])
+    pub fn supports_mwaitx() -> bool {
+        // 0 = Uninitialized, 1 = Supported, 2 = Not Supported
+        static MWAITX_SUPPORT: AtomicU8 = AtomicU8::new(0);
+
+        match MWAITX_SUPPORT.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let supported = unsafe {
+                    let res = std::arch::x86_64::__cpuid(0x8000_0001);
+                    (res.ecx & (1 << 29)) != 0
+                };
+
+                MWAITX_SUPPORT.store(if supported { 1 } else { 2 }, Ordering::Relaxed);
+                supported
+            }
+        }
+    }
+
+    /// Sets up the address range for monitoring.
+    #[inline(always)]
+    pub unsafe fn monitorx(addr: *const i64) {
+        // EAX/RAX = linear address, ECX = 0 (extensions), EDX = 0 (hints)
+        unsafe {
+            asm!(
+                "monitorx",
+                in("rax") addr,
+                in("ecx") 0,
+                in("edx") 0,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    /// Enters implementation-dependent optimized state until a store occurs or timer expires.
+    #[inline(always)]
+    pub unsafe fn mwaitx(timeout_cycles: u32) {
+        // EAX = 0 (Hint C0), ECX = 2 (Enable Timer), EBX = timeout_cycles
+        // LLVM reserves RBX, so we must manually save/restore it and move the input.
+        unsafe {
+            asm!(
+                "push rbx",       // Save LLVM's RBX
+                "mov rbx, {0}",   // Move timeout into RBX
+                "mwaitx",
+                "pop rbx",        // Restore LLVM's RBX
+                in(reg) timeout_cycles as u64,
+                in("rax") 0,      // Hint C0
+                in("rcx") 2,      // Enable Timer extension
+                options(preserves_flags)
+            );
+        }
+    }
+}
+
 struct WaitGuard<'a>(&'a Signal);
 impl Drop for WaitGuard<'_> {
     fn drop(&mut self) {
@@ -431,6 +491,11 @@ impl Signal {
         device: &KfdDevice,
         event_manager: &EventManager,
     ) -> i64 {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let use_mwaitx = x86_utils::supports_mwaitx();
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        let use_mwaitx = false;
+
         let timeout_duration = if timeout_hint_clocks == u64::MAX {
             Duration::from_secs(31536000) // ~1 year (Wait Forever)
         } else {
@@ -463,6 +528,27 @@ impl Signal {
             }
 
             if wait_hint == HsaWaitState::Active || elapsed < spin_duration {
+                if use_mwaitx {
+                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                    {
+                        unsafe { x86_utils::monitorx(self.atomic_val().as_ptr()) };
+
+                        let val_recheck = self.load_relaxed();
+                        if check_condition(val_recheck, condition, compare_value) {
+                            return val_recheck;
+                        }
+
+                        let cycle_timeout = if wait_hint == HsaWaitState::Active {
+                            1000
+                        } else {
+                            60000
+                        };
+
+                        unsafe { x86_utils::mwaitx(cycle_timeout) };
+                        continue;
+                    }
+                }
+
                 std::hint::spin_loop();
                 continue;
             }
@@ -525,6 +611,22 @@ pub fn wait_any(
     assert_eq!(signals.len(), conditions.len());
     assert_eq!(signals.len(), values.len());
 
+    if signals.len() == 1 {
+        let val = signals[0].wait_relaxed(
+            conditions[0],
+            values[0],
+            timeout_clocks,
+            wait_hint,
+            device,
+            event_manager,
+        );
+        return if check_condition(val, conditions[0], values[0]) {
+            0
+        } else {
+            1
+        };
+    }
+
     let frequency = topology::acquire_system_properties()
         .map(|props| props.timestamp_frequency)
         .unwrap_or(1_000_000_000);
@@ -537,7 +639,7 @@ pub fn wait_any(
     };
 
     let start = Instant::now();
-    let spin_duration = Duration::from_micros(20);
+    let spin_duration = Duration::from_micros(200);
 
     for s in signals {
         s.waiting.fetch_add(1, Ordering::Relaxed);
@@ -546,6 +648,10 @@ pub fn wait_any(
     std::sync::atomic::fence(Ordering::SeqCst);
 
     let _guard = GroupWaitGuard(signals);
+
+    let mut events_ref: Vec<&HsaEvent> = signals.iter().map(|s| s.event.as_ref()).collect();
+    events_ref.sort_by_key(|e| e.event_id);
+    events_ref.dedup_by_key(|e| e.event_id);
 
     loop {
         for (i, signal) in signals.iter().enumerate() {
@@ -569,8 +675,6 @@ pub fn wait_any(
             .saturating_sub(elapsed)
             .as_millis()
             .min(u32::MAX as u128) as u32;
-
-        let events_ref: Vec<&HsaEvent> = signals.iter().map(|s| s.event.as_ref()).collect();
 
         let _ = event_manager.wait_on_multiple_events(device, &events_ref, false, wait_ms);
     }
