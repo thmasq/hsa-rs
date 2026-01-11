@@ -37,7 +37,25 @@ mod x86_utils {
         }
     }
 
-    /// Sets up the address range for monitoring.
+    /// Checks if the CPU supports Invariant TSC (CPUID Fn8000_0007_EDX[8]).
+    /// Invariant TSC runs at a constant rate in all ACPI P-states, C-states,
+    /// and T-states, making it safe for timing.
+    pub fn is_tsc_safe() -> bool {
+        static TSC_SAFE: AtomicU8 = AtomicU8::new(0);
+        match TSC_SAFE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let safe = unsafe {
+                    let res = std::arch::x86_64::__cpuid(0x8000_0007);
+                    (res.edx & (1 << 8)) != 0
+                };
+                TSC_SAFE.store(if safe { 1 } else { 2 }, Ordering::Relaxed);
+                safe
+            }
+        }
+    }
+
     #[inline(always)]
     pub unsafe fn monitorx(addr: *const i64) {
         // EAX/RAX = linear address, ECX = 0 (extensions), EDX = 0 (hints)
@@ -69,6 +87,11 @@ mod x86_utils {
                 options(preserves_flags)
             );
         }
+    }
+
+    #[inline(always)]
+    pub unsafe fn rdtsc() -> u64 {
+        unsafe { std::arch::x86_64::_rdtsc() }
     }
 }
 
@@ -496,19 +519,84 @@ impl Signal {
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         let use_mwaitx = false;
 
-        let timeout_duration = if timeout_hint_clocks == u64::MAX {
-            Duration::from_secs(31536000) // ~1 year (Wait Forever)
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let use_tsc = x86_utils::is_tsc_safe();
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        let use_tsc = false;
+
+        match (use_mwaitx, use_tsc) {
+            (true, true) => self.wait_impl::<true, true>(
+                condition,
+                compare_value,
+                timeout_hint_clocks,
+                wait_hint,
+                device,
+                event_manager,
+            ),
+            (true, false) => self.wait_impl::<true, false>(
+                condition,
+                compare_value,
+                timeout_hint_clocks,
+                wait_hint,
+                device,
+                event_manager,
+            ),
+            (false, true) => self.wait_impl::<false, true>(
+                condition,
+                compare_value,
+                timeout_hint_clocks,
+                wait_hint,
+                device,
+                event_manager,
+            ),
+            (false, false) => self.wait_impl::<false, false>(
+                condition,
+                compare_value,
+                timeout_hint_clocks,
+                wait_hint,
+                device,
+                event_manager,
+            ),
+        }
+    }
+
+    #[inline(always)]
+    fn wait_impl<const USE_MWAITX: bool, const USE_TSC: bool>(
+        &self,
+        condition: HsaSignalCondition,
+        compare_value: i64,
+        timeout_hint_clocks: u64,
+        wait_hint: HsaWaitState,
+        device: &KfdDevice,
+        event_manager: &EventManager,
+    ) -> i64 {
+        let frequency = topology::acquire_system_properties()
+            .map(|props| props.timestamp_frequency)
+            .unwrap_or(1_000_000_000);
+
+        let mut tsc_start = 0u64;
+        let mut tsc_spin_cycles = 0u64;
+
+        let mut inst_start = Instant::now();
+        let mut inst_spin_dur = Duration::ZERO;
+        let mut inst_timeout = Duration::ZERO;
+
+        if USE_TSC {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            unsafe {
+                tsc_start = x86_utils::rdtsc();
+                tsc_spin_cycles = (200 * frequency) / 1_000_000; // 200 us
+            }
         } else {
-            let frequency = topology::acquire_system_properties()
-                .map(|props| props.timestamp_frequency)
-                .unwrap_or(1_000_000_000);
-
-            let nanos = (timeout_hint_clocks as u128 * 1_000_000_000) / frequency as u128;
-            Duration::from_nanos(nanos as u64)
-        };
-
-        let start = Instant::now();
-        let spin_duration = Duration::from_micros(20);
+            inst_start = Instant::now();
+            inst_spin_dur = Duration::from_micros(20);
+            inst_timeout = if timeout_hint_clocks == u64::MAX {
+                Duration::from_secs(31536000)
+            } else {
+                let nanos = (timeout_hint_clocks as u128 * 1_000_000_000) / frequency as u128;
+                Duration::from_nanos(nanos as u64)
+            };
+        }
 
         self.waiting.fetch_add(1, Ordering::Relaxed);
 
@@ -522,43 +610,72 @@ impl Signal {
                 return val;
             }
 
-            let elapsed = start.elapsed();
-            if elapsed > timeout_duration {
-                return val;
-            }
+            if USE_TSC {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                unsafe {
+                    let now = x86_utils::rdtsc();
+                    let elapsed = now.wrapping_sub(tsc_start);
 
-            if wait_hint == HsaWaitState::Active || elapsed < spin_duration {
-                if use_mwaitx {
-                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                    {
-                        unsafe { x86_utils::monitorx(self.atomic_val().as_ptr()) };
+                    if timeout_hint_clocks != u64::MAX && elapsed >= timeout_hint_clocks {
+                        return val;
+                    }
 
-                        let val_recheck = self.load_relaxed();
-                        if check_condition(val_recheck, condition, compare_value) {
-                            return val_recheck;
-                        }
-
-                        let cycle_timeout = if wait_hint == HsaWaitState::Active {
-                            1000
+                    if wait_hint != HsaWaitState::Active && elapsed >= tsc_spin_cycles {
+                        let remaining_cycles = if timeout_hint_clocks == u64::MAX {
+                            u64::MAX
                         } else {
-                            60000
+                            timeout_hint_clocks - elapsed
                         };
 
-                        unsafe { x86_utils::mwaitx(cycle_timeout) };
+                        let wait_ms = if remaining_cycles == u64::MAX {
+                            u32::MAX
+                        } else {
+                            ((remaining_cycles as u128 * 1000) / frequency as u128)
+                                .min(u32::MAX as u128) as u32
+                        };
+
+                        let events = vec![self.event.as_ref()];
+                        let _ =
+                            event_manager.wait_on_multiple_events(device, &events, false, wait_ms);
                         continue;
                     }
                 }
+            } else {
+                let elapsed = inst_start.elapsed();
+                if elapsed > inst_timeout {
+                    return val;
+                }
 
-                std::hint::spin_loop();
-                continue;
+                if wait_hint != HsaWaitState::Active && elapsed >= inst_spin_dur {
+                    let remaining = inst_timeout - elapsed;
+                    let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+
+                    let events = vec![self.event.as_ref()];
+                    let _ = event_manager.wait_on_multiple_events(device, &events, false, wait_ms);
+                    continue;
+                }
             }
 
-            let remaining = timeout_duration - elapsed;
-            let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+            if USE_MWAITX {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                unsafe {
+                    x86_utils::monitorx(self.atomic_val().as_ptr());
 
-            let events_to_wait = vec![self.event.as_ref()];
+                    let val_recheck = self.load_relaxed();
+                    if check_condition(val_recheck, condition, compare_value) {
+                        return val_recheck;
+                    }
 
-            let _ = event_manager.wait_on_multiple_events(device, &events_to_wait, false, wait_ms);
+                    let cycle_timeout = if wait_hint == HsaWaitState::Active {
+                        1000
+                    } else {
+                        60000
+                    };
+                    x86_utils::mwaitx(cycle_timeout);
+                }
+            } else {
+                std::hint::spin_loop();
+            }
         }
     }
 
@@ -627,19 +744,71 @@ pub fn wait_any(
         };
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let use_tsc = x86_utils::is_tsc_safe();
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let use_tsc = false;
+
+    if use_tsc {
+        wait_any_impl::<true>(
+            signals,
+            conditions,
+            values,
+            timeout_clocks,
+            wait_hint,
+            device,
+            event_manager,
+        )
+    } else {
+        wait_any_impl::<false>(
+            signals,
+            conditions,
+            values,
+            timeout_clocks,
+            wait_hint,
+            device,
+            event_manager,
+        )
+    }
+}
+
+#[inline(always)]
+fn wait_any_impl<const USE_TSC: bool>(
+    signals: &[&Signal],
+    conditions: &[HsaSignalCondition],
+    values: &[i64],
+    timeout_clocks: u64,
+    wait_hint: HsaWaitState,
+    device: &KfdDevice,
+    event_manager: &EventManager,
+) -> usize {
     let frequency = topology::acquire_system_properties()
         .map(|props| props.timestamp_frequency)
         .unwrap_or(1_000_000_000);
 
-    let timeout_duration = if timeout_clocks == u64::MAX {
-        Duration::from_secs(31536000)
-    } else {
-        let nanos = (timeout_clocks as u128 * 1_000_000_000) / frequency as u128;
-        Duration::from_nanos(nanos as u64)
-    };
+    let mut tsc_start = 0u64;
+    let mut tsc_spin_cycles = 0u64;
 
-    let start = Instant::now();
-    let spin_duration = Duration::from_micros(200);
+    let mut inst_start = Instant::now();
+    let mut inst_spin_dur = Duration::ZERO;
+    let mut inst_timeout = Duration::ZERO;
+
+    if USE_TSC {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        unsafe {
+            tsc_start = x86_utils::rdtsc();
+            tsc_spin_cycles = (200 * frequency) / 1_000_000; // 200us
+        }
+    } else {
+        inst_start = Instant::now();
+        inst_spin_dur = Duration::from_micros(200);
+        inst_timeout = if timeout_clocks == u64::MAX {
+            Duration::from_secs(31536000)
+        } else {
+            let nanos = (timeout_clocks as u128 * 1_000_000_000) / frequency as u128;
+            Duration::from_nanos(nanos as u64)
+        };
+    }
 
     for s in signals {
         s.waiting.fetch_add(1, Ordering::Relaxed);
@@ -661,21 +830,53 @@ pub fn wait_any(
             }
         }
 
-        let elapsed = start.elapsed();
-        if elapsed > timeout_duration {
-            return signals.len();
+        if USE_TSC {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            unsafe {
+                let now = x86_utils::rdtsc();
+                let elapsed = now.wrapping_sub(tsc_start);
+
+                if timeout_clocks != u64::MAX && elapsed >= timeout_clocks {
+                    return signals.len();
+                }
+
+                if wait_hint == HsaWaitState::Active || elapsed < tsc_spin_cycles {
+                    std::hint::spin_loop();
+                    continue;
+                }
+
+                let remaining_cycles = if timeout_clocks == u64::MAX {
+                    u64::MAX
+                } else {
+                    timeout_clocks - elapsed
+                };
+
+                let wait_ms = if remaining_cycles == u64::MAX {
+                    u32::MAX
+                } else {
+                    ((remaining_cycles as u128 * 1000) / frequency as u128).min(u32::MAX as u128)
+                        as u32
+                };
+
+                let _ = event_manager.wait_on_multiple_events(device, &events_ref, false, wait_ms);
+            }
+        } else {
+            let elapsed = inst_start.elapsed();
+            if elapsed > inst_timeout {
+                return signals.len();
+            }
+
+            if wait_hint == HsaWaitState::Active || elapsed < inst_spin_dur {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            let wait_ms = inst_timeout
+                .saturating_sub(elapsed)
+                .as_millis()
+                .min(u32::MAX as u128) as u32;
+
+            let _ = event_manager.wait_on_multiple_events(device, &events_ref, false, wait_ms);
         }
-
-        if wait_hint == HsaWaitState::Active || elapsed < spin_duration {
-            std::hint::spin_loop();
-            continue;
-        }
-
-        let wait_ms = timeout_duration
-            .saturating_sub(elapsed)
-            .as_millis()
-            .min(u32::MAX as u128) as u32;
-
-        let _ = event_manager.wait_on_multiple_events(device, &events_ref, false, wait_ms);
     }
 }
