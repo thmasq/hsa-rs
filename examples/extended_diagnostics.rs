@@ -25,6 +25,7 @@ fn main() -> io::Result<()> {
     println!("    Platform ID:  {}", sys_props.platform_id);
     println!("    Platform Oem: {}", sys_props.platform_oem);
     println!("    Platform Rev: {}", sys_props.platform_rev);
+    println!("    Timestamp Freq:: {}", sys_props.timestamp_frequency);
 
     // 2. Iterate Nodes using Thunk Getters
     for i in 0..sys_props.num_nodes {

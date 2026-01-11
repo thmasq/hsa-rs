@@ -1446,6 +1446,7 @@ pub struct HsaSystemProperties {
     pub platform_id: u32,
     pub platform_rev: u32,
     pub num_nodes: u32,
+    pub timestamp_frequency: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1903,24 +1904,39 @@ impl Topology {
         map
     }
 
-    fn parse_system_properties(path: &Path) -> io::Result<HsaSystemProperties> {
+    pub fn parse_system_properties(path: &Path) -> io::Result<HsaSystemProperties> {
         let content = fs::read_to_string(path)?;
         let mut p = HsaSystemProperties::default();
+
         for line in content.lines() {
             let mut parts = line.split_whitespace();
-            if let (Some(k), Some(v)) = (parts.next(), parts.next())
-                && let Ok(val) = v.parse::<u32>()
-            {
+            if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
                 match k {
-                    "platform_oem" => p.platform_oem = val,
-                    "platform_id" => p.platform_id = val,
-                    "platform_rev" => p.platform_rev = val,
+                    "platform_oem" => p.platform_oem = v.parse::<u32>().unwrap_or(0),
+                    "platform_id" => p.platform_id = v.parse::<u32>().unwrap_or(0),
+                    "platform_rev" => p.platform_rev = v.parse::<u32>().unwrap_or(0),
                     _ => {}
                 }
             }
         }
+
+        p.timestamp_frequency = get_system_clock_frequency();
+
         Ok(p)
     }
+}
+
+fn get_system_clock_frequency() -> u64 {
+    unsafe {
+        let mut ts = std::mem::zeroed();
+        if libc::clock_getres(libc::CLOCK_MONOTONIC, &mut ts) == 0 {
+            if ts.tv_nsec > 0 {
+                return 1_000_000_000 / ts.tv_nsec as u64;
+            }
+        }
+    }
+
+    1_000_000_000
 }
 
 // ===============================================================================================

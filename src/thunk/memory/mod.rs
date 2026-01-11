@@ -31,6 +31,12 @@ pub struct Allocation {
     pub(crate) manager_handle: ArcManager,
 }
 
+impl Allocation {
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+}
+
 impl Drop for Allocation {
     fn drop(&mut self) {
         // 1. Munmap CPU memory if mapped
@@ -62,16 +68,17 @@ impl Drop for Allocation {
 
                 // C. Free GPU resource (KFD Handle)
                 if self.handle != 0
-                    && let Err(e) = self.device.free_memory_of_gpu(self.handle) {
-                        // Ignore PermissionDenied (Os { code: 1 }) as this happens
-                        // for pinned resources like Event Pages during cleanup.
-                        if e.raw_os_error() != Some(1) {
-                            eprintln!(
-                                "[Allocation::drop] Failed to free KFD handle {}: {:?}",
-                                self.handle, e
-                            );
-                        }
+                    && let Err(e) = self.device.free_memory_of_gpu(self.handle)
+                {
+                    // Ignore PermissionDenied (Os { code: 1 }) as this happens
+                    // for pinned resources like Event Pages during cleanup.
+                    if e.raw_os_error() != Some(1) {
+                        eprintln!(
+                            "[Allocation::drop] Failed to free KFD handle {}: {:?}",
+                            self.handle, e
+                        );
                     }
+                }
             }
             Err(e) => {
                 eprintln!(

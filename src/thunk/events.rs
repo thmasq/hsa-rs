@@ -12,6 +12,8 @@ use crate::kfd::sysfs::HsaNodeProperties;
 use crate::thunk::memory::{Allocation, MemoryManager};
 use std::collections::HashMap;
 use std::os::fd::RawFd;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{mem, ptr};
 
 /// The hardware limit for signal events per process.
@@ -104,11 +106,11 @@ pub struct HsaHwException {
 ///
 /// This struct maintains state (`last_event_age`) required to correctly detecting
 /// signal firing, especially for Auto-Reset events.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HsaEvent {
     pub event_id: u32,
     pub event_type: HsaEventType,
-    pub payload: HsaEventDataPayload,
+    pub payload: Mutex<HsaEventDataPayload>,
 
     // Internal hardware data exposed for debugging or IPC
     pub hw_data1: u64, // OsEventHandle
@@ -118,7 +120,7 @@ pub struct HsaEvent {
     // State tracking
     /// The last known "age" (counter) of this event from the kernel.
     /// If the kernel reports an age > this value, the event has fired.
-    pub last_event_age: u64,
+    pub last_event_age: AtomicU64,
 }
 
 /// Manages the global context for events, specifically the Events Page.
@@ -223,11 +225,11 @@ impl EventManager {
         let event = HsaEvent {
             event_id: args.event_id,
             event_type: desc.event_type,
-            payload: HsaEventDataPayload::SyncVar(desc.sync_var),
+            payload: std::sync::Mutex::new(HsaEventDataPayload::SyncVar(desc.sync_var)),
             hw_data1: u64::from(args.event_id),
             hw_data2,
             hw_data3: args.event_trigger_data,
-            last_event_age: 0,
+            last_event_age: std::sync::atomic::AtomicU64::new(0),
         };
 
         // 5. Set Initial Signal State (if requested)
@@ -310,7 +312,7 @@ impl EventManager {
     pub fn wait_on_multiple_events(
         &self,
         device: &KfdDevice,
-        events: &mut [&mut HsaEvent],
+        events: &[&HsaEvent],
         wait_all: bool,
         timeout_ms: u32,
     ) -> HsaResult<Vec<usize>> {
@@ -331,7 +333,8 @@ impl EventManager {
                 // The kernel compares this against the hardware's current age.
                 // If hardware_age > last_event_age, the kernel considers it signaled.
                 if e.event_type == HsaEventType::Signal {
-                    data.payload.signal_event_data.last_event_age = e.last_event_age;
+                    data.payload.signal_event_data.last_event_age =
+                        e.last_event_age.load(Ordering::Relaxed);
                 }
                 data
             })
@@ -357,20 +360,22 @@ impl EventManager {
 
         // Pass 1: Check for definitive hardware signals (Age change or Exception data)
         for (i, ioctl_evt) in ioctl_events.iter().enumerate() {
-            let event = &mut *events[i];
+            let event = events[i];
 
             match event.event_type {
                 HsaEventType::Signal => unsafe {
                     let new_age = ioctl_evt.payload.signal_event_data.last_event_age;
+                    let old_age = event.last_event_age.load(Ordering::Relaxed);
 
                     // If the age returned by kernel is greater than what we had, it fired.
                     // This mechanism is robust against Auto-Reset: even if the signal bit
                     // is already cleared, the age counter increment persists.
-                    if new_age > event.last_event_age {
-                        event.last_event_age = new_age;
+                    if new_age > old_age {
+                        event.last_event_age.store(new_age, Ordering::Relaxed);
                         signaled_indices.push(i);
                     }
                 },
+
                 HsaEventType::Memory => unsafe {
                     // KFD indicates an exception payload by setting the gpu_id field.
                     if ioctl_evt.payload.memory_exception_data.gpu_id != 0 {
@@ -380,7 +385,8 @@ impl EventManager {
                         // If the GPU ID is unknown, we default to 0 (system).
                         let node_id = *self.gpu_to_node_map.get(&data.gpu_id).unwrap_or(&0);
 
-                        event.payload =
+                        let mut payload_guard = event.payload.lock().unwrap();
+                        *payload_guard =
                             HsaEventDataPayload::MemoryAccessFault(HsaMemoryAccessFault {
                                 node_id,
                                 virtual_address: data.va,
@@ -404,7 +410,8 @@ impl EventManager {
 
                         let node_id = *self.gpu_to_node_map.get(&data.gpu_id).unwrap_or(&0);
 
-                        event.payload = HsaEventDataPayload::HwException(HsaHwException {
+                        let mut payload_guard = event.payload.lock().unwrap();
+                        *payload_guard = HsaEventDataPayload::HwException(HsaHwException {
                             node_id,
                             reset_type: data.reset_type,
                             memory_lost: data.memory_lost != 0,
