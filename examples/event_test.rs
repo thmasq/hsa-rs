@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // We MUST lock the memory manager to pass a mutable reference to create_event.
     // We scope this so the lock is dropped immediately after creation.
-    let mut event = {
+    let event = {
         let mut guard = mem_mgr_arc.lock().unwrap();
         event_manager
             .create_event(
@@ -96,8 +96,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 6. TEST 1: Wait Timeout
     println!("\n[TEST 1] Waiting on unsignaled event (Expect Timeout)...");
-    let mut events_to_wait = vec![&mut event];
-    let result = event_manager.wait_on_multiple_events(&device, &mut events_to_wait, false, 500);
+    let events_to_wait = vec![&event];
+    let result = event_manager.wait_on_multiple_events(&device, &events_to_wait, false, 500);
 
     match result {
         Err(HsaError::WaitTimeout) => println!("    SUCCESS: Timed out as expected."),
@@ -112,9 +112,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Failed to signal event: {}", e))?;
 
     println!("    Waiting for signal...");
-    let mut events_to_wait = vec![&mut event];
+    let events_to_wait = vec![&event];
     let result = event_manager
-        .wait_on_multiple_events(&device, &mut events_to_wait, false, 1000)
+        .wait_on_multiple_events(&device, &events_to_wait, false, 1000)
         .map_err(|e| format!("Failed to wait on event: {}", e))?;
 
     if result.contains(&0) {
@@ -128,10 +128,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 8. TEST 3: Event Age / State persistence
     println!("\n[TEST 3] Checking Manual Reset persistence...");
-    let mut events_to_wait = vec![&mut event];
+    let events_to_wait = vec![&event];
     let start = std::time::Instant::now();
     let result = event_manager
-        .wait_on_multiple_events(&device, &mut events_to_wait, false, 1000)
+        .wait_on_multiple_events(&device, &events_to_wait, false, 1000)
         .map_err(|e| format!("Failed second wait: {}", e))?;
 
     if result.contains(&0) && start.elapsed().as_millis() < 100 {
