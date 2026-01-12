@@ -1398,7 +1398,7 @@ fn get_pci_revision_id(domain: u32, location_id: u32) -> Option<u32> {
     None
 }
 
-/// Logic to emulate hsakmt_get_vgpr_size_per_cu based on GFX version
+/// Logic to emulate `hsakmt_get_vgpr_size_per_cu` based on GFX version
 const fn get_vgpr_size_per_cu(major: u32, minor: u32, stepping: u32) -> u32 {
     // Combine into GFX version integer (e.g., 90010 for 9.0.10)
     // Note: The shifting logic here (major << 16) is different from how
@@ -1898,11 +1898,10 @@ impl Topology {
 fn get_system_clock_frequency() -> u64 {
     unsafe {
         let mut ts = std::mem::zeroed();
-        if libc::clock_getres(libc::CLOCK_MONOTONIC, &mut ts) == 0 {
-            if ts.tv_nsec > 0 {
+        if libc::clock_getres(libc::CLOCK_MONOTONIC, &raw mut ts) == 0
+            && ts.tv_nsec > 0 {
                 return 1_000_000_000 / ts.tv_nsec as u64;
             }
-        }
     }
 
     1_000_000_000

@@ -31,8 +31,12 @@ pub struct Allocation {
     pub(crate) manager_handle: ArcManager,
 }
 
+unsafe impl Send for Allocation {}
+unsafe impl Sync for Allocation {}
+
 impl Allocation {
-    pub fn as_mut_ptr(&self) -> *mut u8 {
+    #[must_use]
+    pub const fn as_mut_ptr(&self) -> *mut u8 {
         self.ptr
     }
 }

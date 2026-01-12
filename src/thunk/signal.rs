@@ -17,7 +17,7 @@ mod x86_utils {
     use std::arch::asm;
     use std::sync::atomic::{AtomicU8, Ordering};
 
-    /// Checks for MWAITX support (CPUID Fn8000_0001_ECX[29])
+    /// Checks for MWAITX support (CPUID `Fn8000_0001_ECX`[29])
     pub fn supports_mwaitx() -> bool {
         // 0 = Uninitialized, 1 = Supported, 2 = Not Supported
         static MWAITX_SUPPORT: AtomicU8 = AtomicU8::new(0);
@@ -37,7 +37,7 @@ mod x86_utils {
         }
     }
 
-    /// Checks if the CPU supports Invariant TSC (CPUID Fn8000_0007_EDX[8]).
+    /// Checks if the CPU supports Invariant TSC (CPUID `Fn8000_0007_EDX`[8]).
     /// Invariant TSC runs at a constant rate in all ACPI P-states, C-states,
     /// and T-states, making it safe for timing.
     pub fn is_tsc_safe() -> bool {
@@ -56,6 +56,7 @@ mod x86_utils {
         }
     }
 
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     pub unsafe fn monitorx(addr: *const i64) {
         // EAX/RAX = linear address, ECX = 0 (extensions), EDX = 0 (hints)
@@ -71,6 +72,7 @@ mod x86_utils {
     }
 
     /// Enters implementation-dependent optimized state until a store occurs or timer expires.
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     pub unsafe fn mwaitx(timeout_cycles: u32) {
         // EAX = 0 (Hint C0), ECX = 2 (Enable Timer), EBX = timeout_cycles
@@ -81,7 +83,7 @@ mod x86_utils {
                 "mov rbx, {0}",   // Move timeout into RBX
                 "mwaitx",
                 "pop rbx",        // Restore LLVM's RBX
-                in(reg) timeout_cycles as u64,
+                in(reg) u64::from(timeout_cycles),
                 in("rax") 0,      // Hint C0
                 in("rcx") 2,      // Enable Timer extension
                 options(preserves_flags)
@@ -89,6 +91,7 @@ mod x86_utils {
         }
     }
 
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     pub unsafe fn rdtsc() -> u64 {
         unsafe { std::arch::x86_64::_rdtsc() }
@@ -127,8 +130,9 @@ pub enum HsaWaitState {
     Active = 1,
 }
 
+#[allow(clippy::inline_always)]
 #[inline(always)]
-fn check_condition(value: i64, condition: HsaSignalCondition, compare_value: i64) -> bool {
+const fn check_condition(value: i64, condition: HsaSignalCondition, compare_value: i64) -> bool {
     match condition {
         HsaSignalCondition::Eq => value == compare_value,
         HsaSignalCondition::Ne => value != compare_value,
@@ -175,15 +179,24 @@ const _: () = assert!(std::mem::align_of::<AmdSignal>() == 64);
 const _: () = assert!(std::mem::size_of::<SharedSignal>() == 128);
 const _: () = assert!(mem::offset_of!(SharedSignal, sdma_start_ts) == 64);
 
-/// Manages a pool of SharedSignal slots with a growth factor.
+/// Manages a pool of `SharedSignal` slots with a growth factor.
 #[derive(Debug)]
 pub struct SignalPool {
-    /// Pointers to available 128-byte SharedSignal slots.
+    /// Pointers to available 128-byte `SharedSignal` slots.
     free_list: Vec<*mut SharedSignal>,
     /// Underlying GTT allocations.
     block_list: Vec<Allocation>,
     /// Number of signals to allocate in the next block.
     next_block_signals: usize,
+}
+
+unsafe impl Send for SignalPool {}
+unsafe impl Sync for SignalPool {}
+
+impl Default for SignalPool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SignalPool {
@@ -192,7 +205,8 @@ impl SignalPool {
     /// Maximum number of signals per block (128KB allocation).
     const MAX_BLOCK_SIGNALS: usize = 1024;
 
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             free_list: Vec::new(),
             block_list: Vec::new(),
@@ -200,7 +214,7 @@ impl SignalPool {
         }
     }
 
-    /// Allocates a SharedSignal slot. Grows the pool if necessary.
+    /// Allocates a `SharedSignal` slot. Grows the pool if necessary.
     pub fn alloc(
         &mut self,
         device: &KfdDevice,
@@ -213,7 +227,7 @@ impl SignalPool {
             let block_bytes = num_signals * std::mem::size_of::<SharedSignal>();
 
             let allocation = mem_manager.allocate_gtt(device, block_bytes, node_id, drm_fd)?;
-            let base_ptr = allocation.as_mut_ptr() as *mut SharedSignal;
+            let base_ptr = allocation.as_mut_ptr().cast::<SharedSignal>();
 
             for i in 0..num_signals {
                 unsafe {
@@ -233,7 +247,7 @@ impl SignalPool {
     }
 
     /// Returns a slot to the pool for reuse.
-    pub fn free(&mut self, ptr: *mut SharedSignal) {
+    pub unsafe fn free(&mut self, ptr: *mut SharedSignal) {
         unsafe {
             // Mark kind as invalid so any late GPU/CPU access is recognizable.
             (*ptr).amd_signal.kind = AmdSignalKind::Invalid as i64;
@@ -323,6 +337,7 @@ impl Signal {
     }
 
     /// Internal helper to get the atomic reference.
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     fn atomic_val(&self) -> &AtomicI64 {
         unsafe { &(*self.ptr).amd_signal.value }
@@ -340,7 +355,7 @@ impl Signal {
 
     #[inline]
     pub fn store_relaxed(&self, value: i64) {
-        self.atomic_val().store(value, Ordering::Relaxed)
+        self.atomic_val().store(value, Ordering::Relaxed);
     }
 
     #[inline]
@@ -612,6 +627,7 @@ impl Signal {
         }
     }
 
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     fn wait_impl<const USE_MWAITX: bool, const USE_TSC: bool>(
         &self,
@@ -643,9 +659,10 @@ impl Signal {
             inst_start = Instant::now();
             inst_spin_dur = Duration::from_micros(20);
             inst_timeout = if timeout_hint_clocks == u64::MAX {
-                Duration::from_secs(31536000)
+                Duration::from_secs(31_536_000)
             } else {
-                let nanos = (timeout_hint_clocks as u128 * 1_000_000_000) / frequency as u128;
+                let nanos =
+                    (u128::from(timeout_hint_clocks) * 1_000_000_000) / u128::from(frequency);
                 Duration::from_nanos(nanos as u64)
             };
         }
@@ -682,8 +699,8 @@ impl Signal {
                         let wait_ms = if remaining_cycles == u64::MAX {
                             u32::MAX
                         } else {
-                            ((remaining_cycles as u128 * 1000) / frequency as u128)
-                                .min(u32::MAX as u128) as u32
+                            ((u128::from(remaining_cycles) * 1000) / u128::from(frequency))
+                                .min(u128::from(u32::MAX)) as u32
                         };
 
                         let events = vec![self.event.as_ref()];
@@ -699,8 +716,8 @@ impl Signal {
                 }
 
                 if wait_hint != HsaWaitState::Active && elapsed >= inst_spin_dur {
-                    let remaining = inst_timeout - elapsed;
-                    let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+                    let remaining = inst_timeout.checked_sub(elapsed).unwrap();
+                    let wait_ms = remaining.as_millis().min(u128::from(u32::MAX)) as u32;
 
                     let events = vec![self.event.as_ref()];
                     let _ = event_manager.wait_on_multiple_events(device, &events, false, wait_ms);
@@ -765,7 +782,7 @@ impl Signal {
 
 impl Drop for Signal {
     fn drop(&mut self) {
-        self.pool.lock().unwrap().free(self.ptr);
+        unsafe { self.pool.lock().expect("Poisoned pool").free(self.ptr) };
     }
 }
 
@@ -795,11 +812,7 @@ pub fn wait_any(
             device,
             event_manager,
         );
-        return if check_condition(val, conditions[0], values[0]) {
-            0
-        } else {
-            1
-        };
+        return usize::from(!check_condition(val, conditions[0], values[0]));
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -830,6 +843,7 @@ pub fn wait_any(
     }
 }
 
+#[allow(clippy::inline_always)]
 #[inline(always)]
 fn wait_any_impl<const USE_TSC: bool>(
     signals: &[&Signal],
@@ -861,9 +875,9 @@ fn wait_any_impl<const USE_TSC: bool>(
         inst_start = Instant::now();
         inst_spin_dur = Duration::from_micros(200);
         inst_timeout = if timeout_clocks == u64::MAX {
-            Duration::from_secs(31536000)
+            Duration::from_secs(31_536_000)
         } else {
-            let nanos = (timeout_clocks as u128 * 1_000_000_000) / frequency as u128;
+            let nanos = (u128::from(timeout_clocks) * 1_000_000_000) / u128::from(frequency);
             Duration::from_nanos(nanos as u64)
         };
     }
@@ -912,8 +926,8 @@ fn wait_any_impl<const USE_TSC: bool>(
                 let wait_ms = if remaining_cycles == u64::MAX {
                     u32::MAX
                 } else {
-                    ((remaining_cycles as u128 * 1000) / frequency as u128).min(u32::MAX as u128)
-                        as u32
+                    ((u128::from(remaining_cycles) * 1000) / u128::from(frequency))
+                        .min(u128::from(u32::MAX)) as u32
                 };
 
                 let _ = event_manager.wait_on_multiple_events(device, &events_ref, false, wait_ms);
@@ -932,7 +946,7 @@ fn wait_any_impl<const USE_TSC: bool>(
             let wait_ms = inst_timeout
                 .saturating_sub(elapsed)
                 .as_millis()
-                .min(u32::MAX as u128) as u32;
+                .min(u128::from(u32::MAX)) as u32;
 
             let _ = event_manager.wait_on_multiple_events(device, &events_ref, false, wait_ms);
         }

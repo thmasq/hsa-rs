@@ -49,6 +49,9 @@ pub struct HsaSyncVar {
     pub sync_var_size: u64,
 }
 
+unsafe impl Send for HsaSyncVar {}
+unsafe impl Sync for HsaSyncVar {}
+
 /// Descriptor used to create a new event.
 #[derive(Debug, Clone)]
 pub struct HsaEventDescriptor {
@@ -68,6 +71,9 @@ pub enum HsaEventDataPayload {
     /// Placeholder for other events (`NodeChange`, `DeviceStateChange`, etc.).
     None,
 }
+
+unsafe impl Send for HsaEventDataPayload {}
+unsafe impl Sync for HsaEventDataPayload {}
 
 /// Details of a memory access fault reported by the GPU.
 #[derive(Debug, Clone)]
@@ -122,6 +128,9 @@ pub struct HsaEvent {
     /// If the kernel reports an age > this value, the event has fired.
     pub last_event_age: AtomicU64,
 }
+
+unsafe impl Send for HsaEvent {}
+unsafe impl Sync for HsaEvent {}
 
 /// Manages the global context for events, specifically the Events Page.
 pub struct EventManager {
@@ -355,23 +364,23 @@ impl EventManager {
                         let data = &ioctl_evt.payload.memory_exception_data;
 
                         let node_id = *self.gpu_to_node_map.get(&data.gpu_id).unwrap_or(&0);
-
-                        let mut payload_guard = event.payload.lock().unwrap();
-                        *payload_guard =
-                            HsaEventDataPayload::MemoryAccessFault(HsaMemoryAccessFault {
-                                node_id,
-                                virtual_address: data.va,
-                                failure: HsaAccessAttributeFailure {
-                                    not_present: data.failure.not_present != 0,
-                                    read_only: data.failure.read_only != 0,
-                                    no_execute: data.failure.no_execute != 0,
-                                    imprecise: data.failure.imprecise != 0,
-                                    ecc_error: data.error_type == 1 || data.error_type == 2,
-                                    error_type: data.error_type,
-                                },
-                                is_fatal: true,
-                            });
-
+                        {
+                            let mut payload_guard = event.payload.lock().unwrap();
+                            *payload_guard =
+                                HsaEventDataPayload::MemoryAccessFault(HsaMemoryAccessFault {
+                                    node_id,
+                                    virtual_address: data.va,
+                                    failure: HsaAccessAttributeFailure {
+                                        not_present: data.failure.not_present != 0,
+                                        read_only: data.failure.read_only != 0,
+                                        no_execute: data.failure.no_execute != 0,
+                                        imprecise: data.failure.imprecise != 0,
+                                        ecc_error: data.error_type == 1 || data.error_type == 2,
+                                        error_type: data.error_type,
+                                    },
+                                    is_fatal: true,
+                                });
+                        }
                         signaled_indices.push(i);
                     }
                 },
@@ -380,15 +389,15 @@ impl EventManager {
                         let data = &ioctl_evt.payload.hw_exception_data;
 
                         let node_id = *self.gpu_to_node_map.get(&data.gpu_id).unwrap_or(&0);
-
-                        let mut payload_guard = event.payload.lock().unwrap();
-                        *payload_guard = HsaEventDataPayload::HwException(HsaHwException {
-                            node_id,
-                            reset_type: data.reset_type,
-                            memory_lost: data.memory_lost != 0,
-                            reset_cause: data.reset_cause,
-                        });
-
+                        {
+                            let mut payload_guard = event.payload.lock().unwrap();
+                            *payload_guard = HsaEventDataPayload::HwException(HsaHwException {
+                                node_id,
+                                reset_type: data.reset_type,
+                                memory_lost: data.memory_lost != 0,
+                                reset_cause: data.reset_cause,
+                            });
+                        }
                         signaled_indices.push(i);
                     }
                 },
