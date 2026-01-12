@@ -1,6 +1,5 @@
 #![allow(clippy::used_underscore_items, clippy::cast_possible_truncation)]
 
-// Linux ioctl encoding constants
 const _IOC_NRBITS: u32 = 8;
 const _IOC_TYPEBITS: u32 = 8;
 const _IOC_SIZEBITS: u32 = 14;

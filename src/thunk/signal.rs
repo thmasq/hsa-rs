@@ -298,7 +298,6 @@ impl Signal {
         event_manager: &EventManager,
     ) -> HsaResult<()> {
         self.atomic_val().store(value, Ordering::Release);
-        // A store release acts as a signal. We must notify waiting threads.
         self.notify_event(device, event_manager)
     }
 

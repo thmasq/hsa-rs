@@ -27,7 +27,6 @@ use std::os::unix::io::AsRawFd;
 use std::ptr;
 use std::sync::{Arc, Mutex, Weak};
 
-// Constants from fmm.c
 const SVM_RESERVATION_LIMIT: u64 = (1 << 47) - 1; // 47-bit VA limit
 const SVM_MIN_BASE: u64 = 0x1000_0000; // Start at 256MB
 const SVM_DEFAULT_ALIGN: usize = 4096;
@@ -146,7 +145,6 @@ impl AllocFlags {
         if self.host_access {
             ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC;
         }
-        // KFD Logic: WRITABLE is needed unless ReadOnly is explicit.
         if !self.read_only {
             ioc_flags |= KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE;
         }
@@ -178,30 +176,22 @@ impl AllocFlags {
 struct GpuApertures {
     lds: Aperture,
     scratch: Aperture,
-    _gpuvm: Aperture, // Canonical or Non-Canonical GPUVM aperture
+    _gpuvm: Aperture,
 }
 
 #[derive(Debug)]
 pub struct MemoryManager {
-    // Shared Virtual Memory (SVM) Apertures (System-wide)
     svm_aperture: Aperture,     // Coarse Grain / Default
     svm_alt_aperture: Aperture, // Fine Grain / Uncached
 
-    // Per-node apertures for specific HW requirements
     gpu_apertures: HashMap<u32, GpuApertures>,
-
-    // Mappings
     node_to_gpu_id: HashMap<u32, u32>,
-
-    // Weak self-reference allows Allocations to grab a lock on the Manager
-    // for cleanup (RAII), while avoiding reference cycles.
     self_weak: Option<Weak<Mutex<Self>>>,
 }
 
 impl MemoryManager {
     /// Initialize the FMM context and return a thread-safe, shared handle.
     pub fn new(device: &KfdDevice, nodes: &[HsaNodeProperties]) -> HsaResult<ArcManager> {
-        // 1. Build Node->GPU mapping
         let mut node_to_gpu_id = HashMap::new();
 
         for (idx, node) in nodes.iter().enumerate() {
@@ -210,7 +200,6 @@ impl MemoryManager {
             }
         }
 
-        // 2. Query Process Apertures from KFD
         let num_sysfs_nodes = nodes.len() as u32;
         let mut apertures_vec = vec![ProcessDeviceApertures::default(); num_sysfs_nodes as usize];
 
@@ -222,7 +211,6 @@ impl MemoryManager {
 
         device.get_process_apertures_new(&mut args)?;
 
-        // 3. Process Aperture Info
         let mut gpu_apertures = HashMap::new();
         let mut max_gpuvm_limit = 0;
 
@@ -231,7 +219,6 @@ impl MemoryManager {
                 continue;
             }
 
-            // Find the node_id that corresponds to this gpu_id
             let Some((&node_id, _)) = node_to_gpu_id
                 .iter()
                 .find(|&(_, &gid)| gid == aperture_info.gpu_id)
@@ -248,7 +235,6 @@ impl MemoryManager {
                 0,
             );
 
-            // GPUVM Aperture (for non-canonical or specific ranges)
             let gpuvm = Aperture::new(
                 aperture_info.gpuvm_base,
                 aperture_info.gpuvm_limit,
@@ -270,12 +256,6 @@ impl MemoryManager {
             );
         }
 
-        // 4. Initialize SVM Apertures
-        // Logic from `init_svm_apertures` in fmm.c:
-        // Reserve 0 to 4GB for Fine Grain (Alt)
-        // Reserve 4GB to Limit for Coarse Grain (Default)
-        // Adjust limit based on GPU capabilities found above.
-
         let svm_limit = if max_gpuvm_limit > 0 {
             std::cmp::min(max_gpuvm_limit, SVM_RESERVATION_LIMIT)
         } else {
@@ -283,7 +263,7 @@ impl MemoryManager {
         };
 
         let alt_base = SVM_MIN_BASE;
-        let alt_size = 4 * 1024 * 1024 * 1024; // 4GB for Alt
+        let alt_size = 4 * 1024 * 1024 * 1024;
         let alt_limit = alt_base + alt_size - 1;
 
         let def_base = alt_limit + 1;
@@ -307,12 +287,11 @@ impl MemoryManager {
             svm_alt_aperture,
             gpu_apertures,
             node_to_gpu_id,
-            self_weak: None, // Will be initialized after Arc creation
+            self_weak: None,
         };
 
         let arc_mgr = Arc::new(Mutex::new(mgr));
 
-        // Initialize the weak self-reference
         {
             let mut guard = arc_mgr.lock().unwrap();
             guard.self_weak = Some(Arc::downgrade(&arc_mgr));
@@ -321,7 +300,7 @@ impl MemoryManager {
         Ok(arc_mgr)
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn get_gpu_id(&self, node_id: u32) -> Option<u32> {
         self.node_to_gpu_id.get(&node_id).copied()
     }
@@ -342,10 +321,8 @@ impl MemoryManager {
     ) -> HsaResult<Allocation> {
         let size = if size == 0 { 4096 } else { size };
 
-        // Default to the first GPU node if none specified
         let node_id = node_id.unwrap_or_else(|| *self.node_to_gpu_id.keys().next().unwrap_or(&0));
 
-        // 1. Select Aperture
         let aperture = if flags.scratch {
             &mut self
                 .gpu_apertures
@@ -363,22 +340,17 @@ impl MemoryManager {
                 })?
                 .lds
         } else if flags.coherent || flags.uncached || flags.doorbell {
-            // Fine grain / Signals / Doorbells go to Alt aperture
             &mut self.svm_alt_aperture
         } else {
-            // Standard Data (Coarse Grain)
             &mut self.svm_aperture
         };
 
-        // 2. Allocate Virtual Address (VA) from Aperture
         let va_addr = aperture
             .allocate_va(size, align)
             .ok_or(HsaError::OutOfMemory)?;
 
-        // 3. Prepare IOCTL Flags
         let ioc_flags = flags.to_kfd_ioctl_flags();
 
-        // 4. Call KFD Allocate
         let gpu_id = *self.node_to_gpu_id.get(&node_id).unwrap_or(&0);
         let mut args = AllocMemoryOfGpuArgs {
             va_addr,
@@ -398,7 +370,6 @@ impl MemoryManager {
             }
         }
 
-        // 5. Map to GPU
         let mut map_args = MapMemoryToGpuArgs {
             handle: args.handle,
             device_ids_array_ptr: &raw const gpu_id as u64,
@@ -413,7 +384,6 @@ impl MemoryManager {
             return Err(HsaError::Io(e));
         }
 
-        // 6. Map to CPU (mmap)
         let mut cpu_ptr = ptr::null_mut();
 
         if flags.host_access || flags.doorbell {
@@ -423,7 +393,6 @@ impl MemoryManager {
                 libc::PROT_READ | libc::PROT_WRITE
             };
 
-            // MAP_FIXED is critical for SVM: It ensures the CPU address matches the VA we reserved.
             let mmap_flags = libc::MAP_SHARED | libc::MAP_FIXED;
 
             let mmap_fd = if flags.doorbell {
@@ -443,7 +412,6 @@ impl MemoryManager {
                 );
 
                 if ret == libc::MAP_FAILED {
-                    // Cleanup
                     let mut unmap_args = UnmapMemoryFromGpuArgs {
                         handle: args.handle,
                         device_ids_array_ptr: &raw const gpu_id as u64,
@@ -459,7 +427,6 @@ impl MemoryManager {
             }
         }
 
-        // Upgrade the weak self-reference to get the Arc manager for RAII
         let manager_handle = self
             .self_weak
             .as_ref()
@@ -537,14 +504,11 @@ impl MemoryManager {
         let size = size as usize;
         let flags = AllocFlags::new().doorbell();
 
-        // 1. Allocate VA
         let va_addr = self
             .svm_alt_aperture
             .allocate_va(size, 4096)
             .ok_or(HsaError::OutOfMemory)?;
 
-        // 2. KFD Allocation
-        // Doorbells need specific flags.
         let ioc_flags = KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL
             | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
             | KFD_IOC_ALLOC_MEM_FLAGS_COHERENT
@@ -565,7 +529,6 @@ impl MemoryManager {
             return Err(HsaError::from(e));
         }
 
-        // 3. Mmap
         let cpu_ptr;
         unsafe {
             let ret = libc::mmap(
@@ -585,8 +548,6 @@ impl MemoryManager {
             cpu_ptr = ret.cast::<u32>();
         }
 
-        // 4. RAII Construction
-        // We need the manager handle to construct the Allocation.
         let manager_handle = self
             .self_weak
             .as_ref()
@@ -605,7 +566,6 @@ impl MemoryManager {
             manager_handle,
         };
 
-        // 5. Leak
         // We intentionally forget the RAII object because we are returning a raw pointer
         // to the user, and they expect this mapping to persist for the lifetime of the Queue.
         // If we didn't forget, `allocation` would drop here, immediately unmapping the doorbell.
@@ -633,7 +593,6 @@ impl MemoryManager {
     }
 }
 
-// Implement the Trait for QueueBuilder usage, forwarding to the unified alloc
 impl BuilderMemoryManager for MemoryManager {
     fn allocate_gpu_memory(
         &mut self,
@@ -657,7 +616,6 @@ impl BuilderMemoryManager for MemoryManager {
             flags = flags.host_access();
         }
 
-        // Queue buffers typically need execute access and coherency
         flags = flags.executable().coherent();
 
         self.allocate(device, size, align, flags, None, drm_fd)

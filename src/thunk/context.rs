@@ -65,25 +65,19 @@ pub fn acquire() -> io::Result<Arc<Context>> {
         return Ok(ctx.clone());
     }
 
-    // 1. Open the KFD device
     let kfd_device = KfdDevice::open()?;
 
-    // 2. Acquire system properties (this internally drives the initial topology scan)
     let system_props = acquire_system_properties()?;
 
-    // 3. Build the full Node list by querying all properties for each node
     let mut nodes = Vec::new();
     let num_nodes = system_props.num_nodes;
 
-    // Iterate through node IDs 0 to num_nodes - 1 (Fix for Error 1: no 'nodes' field on HsaSystemProperties)
     for node_id in 0..num_nodes {
-        // Fetch the low-level properties for this node ID
         let node_props = get_node_properties(node_id)?;
 
-        // Query extended properties
         let num_mem_banks = node_props.mem_banks_count;
-        let num_caches = node_props.cpu_cores_count; // Fix for Error 2: use cpu_cores_count
-        let num_links = node_props.io_links_count; // Fix for Error 3: use io_links_count
+        let num_caches = node_props.cpu_cores_count;
+        let num_links = node_props.io_links_count;
 
         let mem_properties = get_node_memory_properties(node_id, num_mem_banks)?;
         let cache_properties = get_node_cache_properties(node_id, 0, num_caches)?;
@@ -100,7 +94,6 @@ pub fn acquire() -> io::Result<Arc<Context>> {
         });
     }
 
-    // 4. Cache and return the new context
     let context = Arc::new(Context {
         device: Arc::new(kfd_device),
         system_properties: system_props,
@@ -120,9 +113,7 @@ pub fn acquire() -> io::Result<Arc<Context>> {
 /// # Panics
 /// Panics if the internal mutex is poisoned.
 pub fn release() {
-    // Drop the content, including the Arc<KfdDevice>, which closes the file descriptor.
     GLOBAL_CONTEXT.lock().unwrap().take();
-    // Also clear the cached topology properties as they are tied to the context state
     release_system_properties();
 }
 
@@ -132,15 +123,12 @@ pub fn release() {
 
 /// Generates a GFX ISA version string from the KFD `EngineId`.
 fn get_isa_name(engine_id: &EngineId) -> String {
-    // This calculation is commonly used in ROCm runtimes to get the GFX version number.
     let major = engine_id.major;
     let minor = engine_id.minor;
     let stepping = engine_id.stepping;
 
     match major {
-        // Assume non-GPU agents (CPUs) don't have an ISA name in this context.
         0 => "cpu".to_string(),
-        // Simple case: gfx900, gfx1010, gfx1100 format
         _ => format!("gfx{major}{minor}{stepping}"),
     }
 }

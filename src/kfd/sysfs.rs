@@ -1346,13 +1346,10 @@ fn lookup_marketing_name_from_file(device_id: u32, revision_id: u32) -> Option<S
             let reader = BufReader::new(file);
             for line in reader.lines().map_while(Result::ok) {
                 let line = line.trim();
-                // Skip comments and empty lines
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
 
-                // Parse: device_id, revision_id, product_name
-                // Example: 1114,    C2,    AMD Radeon 860M Graphics
                 let parts: Vec<&str> = line.split(',').collect();
                 if parts.len() < 3 {
                     continue;
@@ -1365,12 +1362,6 @@ fn lookup_marketing_name_from_file(device_id: u32, revision_id: u32) -> Option<S
                 if let Ok(file_did) = u32::from_str_radix(file_did_str, 16)
                     && file_did == device_id
                 {
-                    // Check Revision:
-                    // Some entries might use wildcards or specific revisions.
-                    // Ideally we match the exact revision if possible.
-                    // However, the file format is strictly "device, rev, name".
-
-                    // If rev is not a valid hex, ignore this line (e.g. version header "1.0.0")
                     if let Ok(file_rid) = u32::from_str_radix(file_rid_str, 16) {
                         if file_rid == revision_id {
                             return Some(product_name);
@@ -1400,7 +1391,6 @@ fn get_pci_revision_id(domain: u32, location_id: u32) -> Option<u32> {
 
     if let Ok(content) = fs::read_to_string(&pci_path) {
         let content = content.trim();
-        // The revision file usually contains a hex string like "0xc2" or "0x00"
         let clean_content = content.strip_prefix("0x").unwrap_or(content);
         return u32::from_str_radix(clean_content, 16).ok();
     }
@@ -1408,19 +1398,18 @@ fn get_pci_revision_id(domain: u32, location_id: u32) -> Option<u32> {
     None
 }
 
-// Logic to emulate hsakmt_get_vgpr_size_per_cu based on GFX version
+/// Logic to emulate hsakmt_get_vgpr_size_per_cu based on GFX version
 const fn get_vgpr_size_per_cu(major: u32, minor: u32, stepping: u32) -> u32 {
     // Combine into GFX version integer (e.g., 90010 for 9.0.10)
     // Note: The shifting logic here (major << 16) is different from how
     // ROCm usually represents it (decimal: 90010).
-    // It's safer to use the logic you already wrote in cwsr.rs.
 
     // Check for "Large VGPR" GFX9 devices (Aldebaran, Arcturus, MI300)
     #[rustfmt::skip]
     let is_large_vgpr_gfx9 = major == 9
         && (
             (minor == 0 && stepping == 8) ||    // Arcturus
-            (minor == 4) ||                 // Aldebaran (9.4.2) & Aqua Vanjaram family
+            (minor == 4) ||                     // Aldebaran (9.4.2) & Aqua Vanjaram family
             (minor == 5 && stepping == 0)       // GFX950
         );
 
@@ -1608,7 +1597,7 @@ impl Topology {
                 .filter_map(std::result::Result::ok)
                 .map(|e| e.path())
                 .collect();
-            // Sort by integer node ID to match sysfs order
+
             paths.sort_by_key(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
@@ -1622,7 +1611,6 @@ impl Topology {
                 {
                     node.properties.node_id = idx as u32;
 
-                    // Enrich CPU nodes with model name
                     if node.properties.cpu_cores_count > 0 {
                         if let Some(info) = cpu_info.get(&node.properties.cpu_core_id_base) {
                             node.properties.marketing_name.clone_from(info);
@@ -1632,7 +1620,6 @@ impl Topology {
                         }
                     }
 
-                    // Enrich GPU nodes (Overrides, Lookups, Derived Props)
                     Self::enrich_gpu_properties(&mut node.properties);
 
                     nodes.push(node);
@@ -1640,23 +1627,18 @@ impl Topology {
             }
         }
 
-        // Calculate Indirect IO Links (GPU <-> CPU <-> GPU)
-        // This requires visibility of all nodes, so must be done after parsing.
         let mut new_links = Vec::new();
         for i in 0..nodes.len() {
             for j in (i + 1)..nodes.len() {
-                // Check i -> j
                 if let Some(link) = Self::calculate_indirect_link(&nodes, i, j) {
                     new_links.push((i, link));
                 }
-                // Check j -> i
                 if let Some(link) = Self::calculate_indirect_link(&nodes, j, i) {
                     new_links.push((j, link));
                 }
             }
         }
 
-        // Apply calculated links
         for (node_idx, link) in new_links {
             if let Some(node) = nodes.get_mut(node_idx) {
                 node.io_links.push(link);
@@ -1673,17 +1655,14 @@ impl Topology {
     }
 
     fn enrich_gpu_properties(props: &mut HsaNodeProperties) {
-        // Bail out if CPU node
         if props.simd_count == 0 {
             return;
         }
 
-        // 1. Decode GFX Target Version
         let mut major = (props.gfx_target_version / 10000) % 100;
         let mut minor = (props.gfx_target_version / 100) % 100;
         let mut step = props.gfx_target_version % 100;
 
-        // 2. Check Overrides (Global and Per-Node)
         let override_var_node = format!("HSA_OVERRIDE_GFX_VERSION_{}", props.node_id);
         let override_val =
             env::var(&override_var_node).or_else(|_| env::var("HSA_OVERRIDE_GFX_VERSION"));
@@ -1697,36 +1676,28 @@ impl Topology {
                     parts[2].parse::<u32>(),
                 )
             {
-                // Valid override found, update local vars
                 major = maj;
                 minor = min;
                 step = stp;
             }
         }
 
-        // 3. Update Engine ID
         props.engine_id = EngineId {
             major,
             minor,
             stepping: step,
         };
 
-        // 2. Lookup Architecture Name (Internal Table)
-        // This is still useful for tools that need the ASIC family name (e.g. "Navi31")
         if let Some(entry) = find_gfx_ip(props.device_id as u16, major as u8) {
             props.amd_name = entry.name.to_string();
-            // If table has stricter versioning, update EngineID
+
             props.engine_id.major = u32::from(entry.major);
             props.engine_id.minor = u32::from(entry.minor);
             props.engine_id.stepping = u32::from(entry.stepping);
         } else {
-            // Default AMD Name
             props.amd_name = format!("GFX{:02x}", props.gfx_target_version);
         }
 
-        // 3. Lookup Marketing Name (amdgpu.ids)
-        // KFD doesn't explicitly expose revision_id in the properties file,
-        // so we must look it up via PCI sysfs using location_id/domain.
         let marketing_name =
             if let Some(rev_id) = get_pci_revision_id(props.domain, props.location_id) {
                 lookup_marketing_name_from_file(props.device_id, rev_id)
@@ -1740,7 +1711,6 @@ impl Topology {
             props.marketing_name = props.amd_name.clone();
         }
 
-        // 4. Derived Properties
         if props.simd_arrays_per_engine != 0 {
             props.num_shader_banks = props.array_count / props.simd_arrays_per_engine;
         }
@@ -1851,7 +1821,6 @@ impl Topology {
             }
         }
 
-        // C code sums the weights
         let total_weight = weight1 + weight2 + weight3;
         if total_weight == 0 {
             return None;
@@ -1947,7 +1916,6 @@ impl Node {
     fn from_sysfs(path: &Path) -> io::Result<Self> {
         let mut properties = Self::parse_node_properties(&path.join("properties"))?;
 
-        // Fallback for GPU ID
         if properties.kfd_gpu_id == 0
             && let Ok(txt) = fs::read_to_string(path.join("gpu_id"))
             && let Ok(val) = txt.trim().parse::<u32>()

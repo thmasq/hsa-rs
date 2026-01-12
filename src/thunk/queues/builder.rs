@@ -38,12 +38,11 @@ pub enum QueuePriority {
 #[derive(Debug)]
 pub struct HsaQueue {
     pub queue_id: u32,
-    pub queue_doorbell: u64,   // Virtual address of doorbell
-    pub queue_read_ptr: u64,   // Virtual address of read ptr
-    pub queue_write_ptr: u64,  // Virtual address of write ptr
-    pub queue_err_reason: u64, // Virtual address of error reason
+    pub queue_doorbell: u64,
+    pub queue_read_ptr: u64,
+    pub queue_write_ptr: u64,
+    pub queue_err_reason: u64,
 
-    // Internal resources kept for lifetime management
     device: KfdDevice,
     eop_mem: Option<Allocation>,
     cwsr_mem: Option<Allocation>,
@@ -52,7 +51,6 @@ pub struct HsaQueue {
 
 impl Drop for HsaQueue {
     fn drop(&mut self) {
-        // 1. Destroy the hardware queue first to stop GPU access
         if let Err(e) = self.device.destroy_queue(self.queue_id) {
             eprintln!(
                 "[HsaQueue] Failed to destroy queue ID {}: {:?}",
@@ -170,22 +168,16 @@ impl<'a> QueueBuilder<'a> {
         let gfx_version = self.node_props.gfx_target_version;
         let is_compute = matches!(self.queue_type, QueueType::Compute | QueueType::ComputeAql);
 
-        // 1. Prepare EOP (End-Of-Pipe) Buffer
         let eop_mem = self.alloc_eop(gfx_version, is_compute)?;
 
-        // 2. Prepare CWSR (Context Save/Restore) Area
-        // Only for GFX8+ (Carrizo+)
         let (cwsr_mem, cwsr_sizes) = self.alloc_cwsr(gfx_version, is_compute)?;
 
-        // 3. Allocate Queue Read/Write Pointers (if needed)
-        // These are small 64-bit counters usually placed in a 4K page.
         let ptr_mem = self.alloc_pointers()?;
 
         let rptr_va = ptr_mem.gpu_va;
         let wptr_va = ptr_mem.gpu_va + 8;
         let ptr_mem = Some(ptr_mem);
 
-        // 4. Setup IOCTL Arguments
         let mut args = CreateQueueArgs {
             gpu_id: self.node_props.kfd_gpu_id,
             ring_base_address: self.ring_base,
@@ -202,9 +194,7 @@ impl<'a> QueueBuilder<'a> {
             ..Default::default()
         };
 
-        // Pointers setup
         if self.queue_type == QueueType::ComputeAql {
-            // For AQL, pointers are inside the ring buffer/packet processor.
             args.read_pointer_address = 0;
             args.write_pointer_address = 0;
         } else {
@@ -212,7 +202,6 @@ impl<'a> QueueBuilder<'a> {
             args.write_pointer_address = wptr_va;
         }
 
-        // EOP & CWSR Args
         if let Some(eop) = &eop_mem {
             args.eop_buffer_address = eop.gpu_va;
             args.eop_buffer_size = eop.size as u64;
@@ -224,17 +213,13 @@ impl<'a> QueueBuilder<'a> {
             args.ctl_stack_size = sizes.ctl_stack_size;
         }
 
-        // 5. Call KFD CreateQueue IOCTL
         if let Err(e) = self.device.create_queue(&mut args) {
             eprintln!("KFD CreateQueue failed: {e:?}");
             return Err(HsaError::from(e));
         }
 
-        // 6. Map Doorbell
-        // We do this after creation because we need the doorbell_offset returned by KFD.
         let doorbell_ptr = self.resolve_doorbell_ptr(args.doorbell_offset, gfx_version)?;
 
-        // 7. Construct RAII Result
         Ok(HsaQueue {
             queue_id: args.queue_id,
             queue_doorbell: doorbell_ptr as u64,
@@ -242,10 +227,8 @@ impl<'a> QueueBuilder<'a> {
             queue_write_ptr: wptr_va,
             queue_err_reason: 0,
 
-            // Clone the device handle (cheap Arc clone) so the queue can clean itself up on Drop
             device: self.device.clone(),
 
-            // Transfer ownership of allocations to the queue struct
             eop_mem,
             cwsr_mem,
             ptr_mem,
@@ -298,7 +281,6 @@ impl<'a> QueueBuilder<'a> {
             && is_compute
             && let Some(sizes) = cwsr::calculate_sizes(self.node_props)
         {
-            // CWSR prefers GTT (Host Allocated) so CPU can write the header easily.
             let alloc = self
                 .mem_mgr
                 .allocate_gpu_memory(
@@ -313,15 +295,8 @@ impl<'a> QueueBuilder<'a> {
                     eprintln!("Failed to allocate CWSR");
                 })?;
 
-            // Initialize Header
             unsafe {
-                cwsr::init_header(
-                    alloc.ptr,
-                    &sizes,
-                    self.node_props.num_xcc,
-                    0, // ErrorEventId (placeholder)
-                    0, // ErrorReason (placeholder)
-                );
+                cwsr::init_header(alloc.ptr, &sizes, self.node_props.num_xcc, 0, 0);
             }
 
             return Ok((Some(alloc), Some(sizes)));
@@ -348,12 +323,10 @@ impl<'a> QueueBuilder<'a> {
         let major = (gfx_version / 10000) % 100;
         let minor = (gfx_version / 100) % 100;
 
-        // GFX943 (Aqua Vanjaram) special case
         if major == 9 && minor == 4 {
             return if is_compute { 4096 } else { 0 };
         }
 
-        // GFX8+ (Volcanic Islands and later)
         if major >= 8 {
             return 4096;
         }
@@ -382,7 +355,6 @@ impl<'a> QueueBuilder<'a> {
     ) -> HsaResult<*mut u32> {
         let is_soc15 = gfx_version >= 90000;
 
-        // Doorbell page size logic: SOC15+ uses 8 byte doorbells (conceptually), pre-SOC15 4KB.
         let doorbell_page_size = if gfx_version >= 90000 { 8 } else { 4 } * 1024;
 
         let mask = (doorbell_page_size - 1) as u64;
@@ -407,7 +379,6 @@ impl<'a> QueueBuilder<'a> {
         // The Kernel ensures `kernel_offset` corresponds to a valid 4-byte aligned doorbell register.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
-            // base_ptr is the start of the page. Add the offset to get the specific queue doorbell.
             let byte_ptr = base_ptr.cast::<u8>().add(ptr_offset as usize);
             Ok(byte_ptr.cast::<u32>())
         }

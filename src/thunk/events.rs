@@ -175,21 +175,16 @@ impl EventManager {
             ..Default::default()
         };
 
-        // 1. Ensure Events Page exists if not already allocated.
-        // The events page is an array of 64-bit slots (8 bytes) * KFD_SIGNAL_EVENT_LIMIT.
         if self.events_page.is_none() {
             let alloc_size = KFD_SIGNAL_EVENT_LIMIT * 8;
 
-            // Use GTT (System Memory) instead of VRAM.
-            // This ensures CPU access (mapped) and Coherency.
             let events_alloc = memory_manager
                 .allocate_gtt(device, alloc_size, desc.node_id, drm_fd)
                 .map_err(|e| -> HsaError {
                     eprintln!("Failed to allocate events page: {e:?}");
                     e
-                })?; // Propagate HsaError from memory manager
+                })?;
 
-            // Zero the memory
             if !events_alloc.ptr.is_null() {
                 unsafe { ptr::write_bytes(events_alloc.ptr, 0, alloc_size) };
             }
@@ -197,25 +192,18 @@ impl EventManager {
             self.events_page = Some(events_alloc);
         }
 
-        // 2. Setup arguments with the allocated page handle.
-        // KFD requires the Buffer Object (BO) Handle for the event page.
         if let Some(alloc) = &self.events_page {
             args.event_page_offset = alloc.handle;
         }
 
-        // 3. Call Create Event IOCTL
         if let Err(e) = unsafe { device.ioctl(AMDKFD_IOC_CREATE_EVENT, &mut args) } {
             eprintln!("AMDKFD_IOC_CREATE_EVENT failed: {e:?}");
             return Err(HsaError::from(e));
         }
 
-        // 4. Calculate HW Address
-        // The HW address is the CPU-mapped pointer to the specific slot in the events page.
-        // This allows userspace to poll the event slot directly if needed.
         let hw_data2 = if let Some(alloc) = &self.events_page
             && args.event_slot_index < KFD_SIGNAL_EVENT_LIMIT as u32
         {
-            // Pointer arithmetic: base_ptr + (slot_index * 8 bytes)
             let base = alloc.ptr as u64;
             base + (u64::from(args.event_slot_index) * 8)
         } else {
@@ -232,15 +220,12 @@ impl EventManager {
             last_event_age: std::sync::atomic::AtomicU64::new(0),
         };
 
-        // 5. Set Initial Signal State (if requested)
-        // System events (like Exceptions) cannot be manually signaled.
         if is_signaled && !desc.event_type.is_system_event() {
             let mut set_args = SetEventArgs {
                 event_id: args.event_id,
                 pad: 0,
             };
             if let Err(e) = unsafe { device.ioctl(AMDKFD_IOC_SET_EVENT, &mut set_args) } {
-                // If setting the initial state fails, we must destroy the event to avoid leaking.
                 self.destroy_event(device, &event).ok();
                 return Err(HsaError::from(e));
             }
@@ -320,8 +305,6 @@ impl EventManager {
             return Err(HsaError::General("No events to wait on.".into()));
         }
 
-        // 1. Prepare input array for IOCTL
-        // We map our high-level HsaEvent to the raw `struct kfd_event_data`.
         let mut ioctl_events: Vec<IoctlEventData> = events
             .iter()
             .map(|e| {
@@ -329,9 +312,6 @@ impl EventManager {
                 data.event_id = e.event_id;
                 data.kfd_event_data_ext = 0;
 
-                // CRITICAL: Pass the last known age to the kernel.
-                // The kernel compares this against the hardware's current age.
-                // If hardware_age > last_event_age, the kernel considers it signaled.
                 if e.event_type == HsaEventType::Signal {
                     data.payload.signal_event_data.last_event_age =
                         e.last_event_age.load(Ordering::Relaxed);
@@ -348,17 +328,14 @@ impl EventManager {
             wait_result: 0,
         };
 
-        // 2. Call Wait IOCTL
         unsafe { device.ioctl(AMDKFD_IOC_WAIT_EVENTS, &mut args)? };
 
         if args.wait_result == KFD_IOC_WAIT_RESULT_TIMEOUT {
             return Err(HsaError::WaitTimeout);
         }
 
-        // 3. Process results and identify which events signaled
         let mut signaled_indices = Vec::new();
 
-        // Pass 1: Check for definitive hardware signals (Age change or Exception data)
         for (i, ioctl_evt) in ioctl_events.iter().enumerate() {
             let event = events[i];
 
@@ -367,9 +344,6 @@ impl EventManager {
                     let new_age = ioctl_evt.payload.signal_event_data.last_event_age;
                     let old_age = event.last_event_age.load(Ordering::Relaxed);
 
-                    // If the age returned by kernel is greater than what we had, it fired.
-                    // This mechanism is robust against Auto-Reset: even if the signal bit
-                    // is already cleared, the age counter increment persists.
                     if new_age > old_age {
                         event.last_event_age.store(new_age, Ordering::Relaxed);
                         signaled_indices.push(i);
@@ -377,12 +351,9 @@ impl EventManager {
                 },
 
                 HsaEventType::Memory => unsafe {
-                    // KFD indicates an exception payload by setting the gpu_id field.
                     if ioctl_evt.payload.memory_exception_data.gpu_id != 0 {
                         let data = &ioctl_evt.payload.memory_exception_data;
 
-                        // Use the map to get the real Node ID.
-                        // If the GPU ID is unknown, we default to 0 (system).
                         let node_id = *self.gpu_to_node_map.get(&data.gpu_id).unwrap_or(&0);
 
                         let mut payload_guard = event.payload.lock().unwrap();
@@ -422,19 +393,13 @@ impl EventManager {
                     }
                 },
                 _ => {
-                    // System events usually don't track age, so if wait returned, assume signaled.
                     signaled_indices.push(i);
                 }
             }
         }
 
-        // Pass 2: Fallback for Software Signals
-        // If KFD returned Success (Wait Complete), but we found no hardware age changes,
-        // it means we were woken by a software signal (set_event) which doesn't update age.
         if signaled_indices.is_empty() && args.wait_result == 0 {
             for (i, event) in events.iter().enumerate() {
-                // We assume Signal events might be the culprit.
-                // Exceptions/System events would have been caught above by data presence.
                 if event.event_type == HsaEventType::Signal {
                     signaled_indices.push(i);
                 }
