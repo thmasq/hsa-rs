@@ -6,8 +6,8 @@ use crate::thunk::topology;
 use std::mem;
 use std::os::fd::RawFd;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub type HsaSignalValue = i64;
@@ -175,6 +175,73 @@ const _: () = assert!(std::mem::align_of::<AmdSignal>() == 64);
 const _: () = assert!(std::mem::size_of::<SharedSignal>() == 128);
 const _: () = assert!(mem::offset_of!(SharedSignal, sdma_start_ts) == 64);
 
+/// Manages a pool of SharedSignal slots with a growth factor.
+#[derive(Debug)]
+pub struct SignalPool {
+    /// Pointers to available 128-byte SharedSignal slots.
+    free_list: Vec<*mut SharedSignal>,
+    /// Underlying GTT allocations.
+    block_list: Vec<Allocation>,
+    /// Number of signals to allocate in the next block.
+    next_block_signals: usize,
+}
+
+impl SignalPool {
+    /// Initial number of signals per block (1 physical 4KB page).
+    const INITIAL_BLOCK_SIGNALS: usize = 32;
+    /// Maximum number of signals per block (128KB allocation).
+    const MAX_BLOCK_SIGNALS: usize = 1024;
+
+    pub fn new() -> Self {
+        Self {
+            free_list: Vec::new(),
+            block_list: Vec::new(),
+            next_block_signals: Self::INITIAL_BLOCK_SIGNALS,
+        }
+    }
+
+    /// Allocates a SharedSignal slot. Grows the pool if necessary.
+    pub fn alloc(
+        &mut self,
+        device: &KfdDevice,
+        mem_manager: &mut MemoryManager,
+        node_id: u32,
+        drm_fd: RawFd,
+    ) -> HsaResult<*mut SharedSignal> {
+        if self.free_list.is_empty() {
+            let num_signals = self.next_block_signals;
+            let block_bytes = num_signals * std::mem::size_of::<SharedSignal>();
+
+            let allocation = mem_manager.allocate_gtt(device, block_bytes, node_id, drm_fd)?;
+            let base_ptr = allocation.as_mut_ptr() as *mut SharedSignal;
+
+            for i in 0..num_signals {
+                unsafe {
+                    let slot_ptr = base_ptr.add(i);
+                    std::ptr::write_bytes(slot_ptr, 0, 1);
+                    (*slot_ptr).amd_signal.kind = AmdSignalKind::Invalid as i64;
+                    (*slot_ptr).id = 0x71FC_CA6A_3D5D_5276;
+                    self.free_list.push(slot_ptr);
+                }
+            }
+
+            self.block_list.push(allocation);
+            self.next_block_signals = (num_signals * 2).min(Self::MAX_BLOCK_SIGNALS);
+        }
+
+        Ok(self.free_list.pop().expect("Pool must have free slots"))
+    }
+
+    /// Returns a slot to the pool for reuse.
+    pub fn free(&mut self, ptr: *mut SharedSignal) {
+        unsafe {
+            // Mark kind as invalid so any late GPU/CPU access is recognizable.
+            (*ptr).amd_signal.kind = AmdSignalKind::Invalid as i64;
+            self.free_list.push(ptr);
+        }
+    }
+}
+
 /// A high-level HSA Signal wrapper.
 ///
 /// This struct manages the lifecycle of a `SharedSignal` block and its associated
@@ -189,9 +256,9 @@ pub struct Signal {
     /// We keep an Arc to share it with wait lists.
     event: Arc<HsaEvent>,
 
-    /// The backing memory allocation.
+    /// The backing memory allocation pool.
     /// Keeping this alive ensures the `ptr` remains valid and mapped in GTT.
-    _allocation: Allocation,
+    pool: Arc<Mutex<SignalPool>>,
 
     /// Tracks how many threads are currently waiting on this signal.
     /// Matches `waiting_` in `signal.h`.
@@ -216,25 +283,14 @@ impl Signal {
         device: &KfdDevice,
         event_manager: &mut EventManager,
         mem_manager: &mut MemoryManager,
+        pool: Arc<Mutex<SignalPool>>,
         drm_fd: RawFd,
         node_id: u32,
     ) -> HsaResult<Self> {
-        // 1. Allocate memory for SharedSignal (128 bytes).
-        // We use allocate_gtt to ensure it's system memory accessible by the GPU (Coherent).
-        // The memory manager handles 4KB page granularity, but we only need 128 bytes.
-        // In a real optimized runtime, we would use a pool allocator (like `SharedSignalPool_t`).
-        // For this implementation, we allocate a full page per signal to ensure correctness and safety.
-        let allocation = mem_manager.allocate_gtt(
-            device,
-            std::mem::size_of::<SharedSignal>(),
-            node_id,
-            drm_fd,
-        )?;
-
-        let ptr = allocation.as_mut_ptr() as *mut SharedSignal;
-        unsafe {
-            ptr::write_bytes(ptr, 0, 1);
-        }
+        let ptr = pool
+            .lock()
+            .unwrap()
+            .alloc(device, mem_manager, node_id, drm_fd)?;
 
         let event_desc = HsaEventDescriptor {
             event_type: HsaEventType::Signal,
@@ -256,15 +312,12 @@ impl Signal {
 
             signal.event_id = event.event_id;
             signal.event_mailbox_ptr = event.hw_data2;
-
-            (*ptr).core_signal = 0;
-            (*ptr).id = 0x71FC_CA6A_3D5D_5276;
         }
 
         Ok(Self {
             ptr,
             event,
-            _allocation: allocation,
+            pool,
             waiting: AtomicU32::new(0),
         })
     }
@@ -707,6 +760,12 @@ impl Signal {
             event_manager.set_event(device, self.event.as_ref())?;
         }
         Ok(())
+    }
+}
+
+impl Drop for Signal {
+    fn drop(&mut self) {
+        self.pool.lock().unwrap().free(self.ptr);
     }
 }
 
