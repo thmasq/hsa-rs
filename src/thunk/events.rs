@@ -127,10 +127,44 @@ pub struct HsaEvent {
     /// The last known "age" (counter) of this event from the kernel.
     /// If the kernel reports an age > this value, the event has fired.
     pub last_event_age: AtomicU64,
+    pub device: KfdDevice,
 }
 
 unsafe impl Send for HsaEvent {}
 unsafe impl Sync for HsaEvent {}
+
+impl Drop for HsaEvent {
+    fn drop(&mut self) {
+        // When the generic HsaEvent is dropped (e.g., the last Arc is released),
+        // we automatically tell the kernel to destroy the event object.
+        // We ignore errors here because we can't panic in Drop.
+        let _ = self.device.destroy_event(self.event_id);
+    }
+}
+
+impl HsaEvent {
+    /// Signals the event (sets it to signaled state).
+    pub fn set(&self) -> HsaResult<()> {
+        if self.event_type.is_system_event() {
+            return Err(HsaError::General(
+                "Cannot manually set system event.".into(),
+            ));
+        }
+        self.device.set_event(self.event_id).map_err(HsaError::from)
+    }
+
+    /// Resets the event (sets it to non-signaled state).
+    pub fn reset(&self) -> HsaResult<()> {
+        if self.event_type.is_system_event() {
+            return Err(HsaError::General(
+                "Cannot manually reset system event.".into(),
+            ));
+        }
+        self.device
+            .reset_event(self.event_id)
+            .map_err(HsaError::from)
+    }
+}
 
 /// Manages the global context for events, specifically the Events Page.
 pub struct EventManager {
@@ -227,6 +261,7 @@ impl EventManager {
             hw_data2,
             hw_data3: args.event_trigger_data,
             last_event_age: std::sync::atomic::AtomicU64::new(0),
+            device: device.clone(),
         };
 
         if is_signaled && !desc.event_type.is_system_event() {
