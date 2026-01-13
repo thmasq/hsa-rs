@@ -151,7 +151,7 @@ const fn check_condition(value: i64, condition: HsaSignalCondition, compare_valu
 }
 
 #[repr(i64)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum AmdSignalKind {
     Invalid = 0,
     User = 1,
@@ -301,6 +301,9 @@ pub struct Signal {
     /// Tracks the agent associated with an asynchronous copy operation.
     /// Used for resource accounting and identifying the copy path (SDMA vs Blit).
     async_copy_agent: AtomicU64,
+
+    /// The type of the signal (User, Doorbell, etc.)
+    kind: AmdSignalKind,
 }
 
 unsafe impl Send for Signal {}
@@ -416,6 +419,7 @@ impl Signal {
             waiting: AtomicU32::new(0),
             gpu_base_va,
             async_copy_agent: AtomicU64::new(0),
+            kind,
         };
 
         let signal_arc = Arc::new(signal);
@@ -495,18 +499,29 @@ impl Signal {
         unsafe { &(*self.ptr).amd_signal.value }
     }
 
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn check_user_signal(&self) {
+        if self.kind != AmdSignalKind::User {
+            panic!("Operation forbidden on Doorbell signals");
+        }
+    }
+
     #[inline]
     pub fn load_relaxed(&self) -> i64 {
+        self.check_user_signal();
         self.atomic_val().load(Ordering::Relaxed)
     }
 
     #[inline]
     pub fn load_acquire(&self) -> i64 {
+        self.check_user_signal();
         self.atomic_val().load(Ordering::Acquire)
     }
 
     #[inline]
     pub fn store_relaxed(&self, value: i64) {
+        self.check_user_signal();
         self.atomic_val().store(value, Ordering::Relaxed);
     }
 
@@ -517,17 +532,20 @@ impl Signal {
         device: &KfdDevice,
         event_manager: &EventManager,
     ) -> HsaResult<()> {
+        self.check_user_signal();
         self.atomic_val().store(value, Ordering::Release);
         self.notify_event(device, event_manager)
     }
 
     #[inline]
     pub fn exchange_relaxed(&self, value: i64) -> i64 {
+        self.check_user_signal();
         self.atomic_val().swap(value, Ordering::Relaxed)
     }
 
     #[inline]
     pub fn exchange_acquire(&self, value: i64) -> i64 {
+        self.check_user_signal();
         self.atomic_val().swap(value, Ordering::Acquire)
     }
 
@@ -538,6 +556,7 @@ impl Signal {
         device: &KfdDevice,
         event_manager: &EventManager,
     ) -> i64 {
+        self.check_user_signal();
         let ret = self.atomic_val().swap(value, Ordering::Release);
         let _ = self.notify_event(device, event_manager);
         ret
@@ -550,6 +569,7 @@ impl Signal {
         device: &KfdDevice,
         event_manager: &EventManager,
     ) -> i64 {
+        self.check_user_signal();
         let ret = self.atomic_val().swap(value, Ordering::AcqRel);
         let _ = self.notify_event(device, event_manager);
         ret
@@ -557,6 +577,7 @@ impl Signal {
 
     #[inline]
     pub fn cas_relaxed(&self, expected: i64, value: i64) -> i64 {
+        self.check_user_signal();
         self.atomic_val()
             .compare_exchange(expected, value, Ordering::Relaxed, Ordering::Relaxed)
             .unwrap_or_else(|x| x)
@@ -564,6 +585,7 @@ impl Signal {
 
     #[inline]
     pub fn cas_acquire(&self, expected: i64, value: i64) -> i64 {
+        self.check_user_signal();
         self.atomic_val()
             .compare_exchange(expected, value, Ordering::Acquire, Ordering::Acquire)
             .unwrap_or_else(|x| x)
@@ -577,6 +599,7 @@ impl Signal {
         device: &KfdDevice,
         event_manager: &EventManager,
     ) -> i64 {
+        self.check_user_signal();
         let res = self.atomic_val().compare_exchange(
             expected,
             value,
@@ -597,6 +620,7 @@ impl Signal {
         device: &KfdDevice,
         event_manager: &EventManager,
     ) -> i64 {
+        self.check_user_signal();
         let res = self.atomic_val().compare_exchange(
             expected,
             value,
@@ -611,110 +635,130 @@ impl Signal {
 
     #[inline]
     pub fn add_relaxed(&self, value: i64) {
+        self.check_user_signal();
         self.atomic_val().fetch_add(value, Ordering::Relaxed);
     }
 
     #[inline]
     pub fn add_acquire(&self, value: i64) {
+        self.check_user_signal();
         self.atomic_val().fetch_add(value, Ordering::Acquire);
     }
 
     #[inline]
     pub fn add_release(&self, value: i64, device: &KfdDevice, event_manager: &EventManager) {
+        self.check_user_signal();
         self.atomic_val().fetch_add(value, Ordering::Release);
         let _ = self.notify_event(device, event_manager);
     }
 
     #[inline]
     pub fn add_acq_rel(&self, value: i64, device: &KfdDevice, event_manager: &EventManager) {
+        self.check_user_signal();
         self.atomic_val().fetch_add(value, Ordering::AcqRel);
         let _ = self.notify_event(device, event_manager);
     }
 
     #[inline]
     pub fn sub_relaxed(&self, value: i64) {
+        self.check_user_signal();
         self.atomic_val().fetch_sub(value, Ordering::Relaxed);
     }
 
     #[inline]
     pub fn sub_acquire(&self, value: i64) {
+        self.check_user_signal();
         self.atomic_val().fetch_sub(value, Ordering::Acquire);
     }
 
     #[inline]
     pub fn sub_release(&self, value: i64, device: &KfdDevice, event_manager: &EventManager) {
+        self.check_user_signal();
         self.atomic_val().fetch_sub(value, Ordering::Release);
         let _ = self.notify_event(device, event_manager);
     }
 
     #[inline]
     pub fn sub_acq_rel(&self, value: i64, device: &KfdDevice, event_manager: &EventManager) {
+        self.check_user_signal();
         self.atomic_val().fetch_sub(value, Ordering::AcqRel);
         let _ = self.notify_event(device, event_manager);
     }
 
     #[inline]
     pub fn and_relaxed(&self, value: i64) {
+        self.check_user_signal();
         self.atomic_val().fetch_and(value, Ordering::Relaxed);
     }
 
     #[inline]
     pub fn and_acquire(&self, value: i64) {
+        self.check_user_signal();
         self.atomic_val().fetch_and(value, Ordering::Acquire);
     }
 
     #[inline]
     pub fn and_release(&self, value: i64, device: &KfdDevice, event_manager: &EventManager) {
+        self.check_user_signal();
         self.atomic_val().fetch_and(value, Ordering::Release);
         let _ = self.notify_event(device, event_manager);
     }
 
     #[inline]
     pub fn and_acq_rel(&self, value: i64, device: &KfdDevice, event_manager: &EventManager) {
+        self.check_user_signal();
         self.atomic_val().fetch_and(value, Ordering::AcqRel);
         let _ = self.notify_event(device, event_manager);
     }
 
     #[inline]
     pub fn or_relaxed(&self, value: i64) {
+        self.check_user_signal();
         self.atomic_val().fetch_or(value, Ordering::Relaxed);
     }
 
     #[inline]
     pub fn or_acquire(&self, value: i64) {
+        self.check_user_signal();
         self.atomic_val().fetch_or(value, Ordering::Acquire);
     }
 
     #[inline]
     pub fn or_release(&self, value: i64, device: &KfdDevice, event_manager: &EventManager) {
+        self.check_user_signal();
         self.atomic_val().fetch_or(value, Ordering::Release);
         let _ = self.notify_event(device, event_manager);
     }
 
     #[inline]
     pub fn or_acq_rel(&self, value: i64, device: &KfdDevice, event_manager: &EventManager) {
+        self.check_user_signal();
         self.atomic_val().fetch_or(value, Ordering::AcqRel);
         let _ = self.notify_event(device, event_manager);
     }
 
     #[inline]
     pub fn xor_relaxed(&self, value: i64) {
+        self.check_user_signal();
         self.atomic_val().fetch_xor(value, Ordering::Relaxed);
     }
 
     #[inline]
     pub fn xor_acquire(&self, value: i64) {
+        self.check_user_signal();
         self.atomic_val().fetch_xor(value, Ordering::Acquire);
     }
 
     #[inline]
     pub fn xor_release(&self, value: i64, device: &KfdDevice, event_manager: &EventManager) {
+        self.check_user_signal();
         self.atomic_val().fetch_xor(value, Ordering::Release);
         let _ = self.notify_event(device, event_manager);
     }
 
     #[inline]
     pub fn xor_acq_rel(&self, value: i64, device: &KfdDevice, event_manager: &EventManager) {
+        self.check_user_signal();
         self.atomic_val().fetch_xor(value, Ordering::AcqRel);
         let _ = self.notify_event(device, event_manager);
     }
@@ -733,6 +777,8 @@ impl Signal {
         device: &KfdDevice,
         event_manager: &EventManager,
     ) -> i64 {
+        self.check_user_signal();
+
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         let use_mwaitx = x86_utils::supports_mwaitx();
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
