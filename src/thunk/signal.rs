@@ -3,14 +3,21 @@ use crate::kfd::device::KfdDevice;
 use crate::thunk::events::{EventManager, HsaEvent, HsaEventDescriptor, HsaEventType, HsaSyncVar};
 use crate::thunk::memory::{Allocation, MemoryManager};
 use crate::thunk::topology;
+use std::collections::HashMap;
 use std::mem;
 use std::os::fd::RawFd;
 use std::ptr;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 pub type HsaSignalValue = i64;
+
+static IPC_MAP: OnceLock<RwLock<HashMap<u64, Weak<Signal>>>> = OnceLock::new();
+
+fn get_ipc_map() -> &'static RwLock<HashMap<u64, Weak<Signal>>> {
+    IPC_MAP.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86_utils {
@@ -141,7 +148,6 @@ const fn check_condition(value: i64, condition: HsaSignalCondition, compare_valu
     }
 }
 
-#[allow(dead_code)]
 #[repr(i64)]
 #[derive(Debug, Copy, Clone)]
 enum AmdSignalKind {
@@ -429,6 +435,30 @@ impl Signal {
         }
 
         Ok(signal_arc)
+    }
+
+    // =====================================================================================
+    // IPC Logic
+    // =====================================================================================
+
+    /// Exports this signal for IPC, registering it in the global IPC map.
+    ///
+    /// Returns the IPC handle (GPU virtual address) which can be passed to
+    /// `import_ipc` to retrieve a reference to this signal.
+    pub fn export_ipc(self: &Arc<Self>) -> u64 {
+        let handle = self.signal_handle_gpu_va();
+        let mut map = get_ipc_map().write().unwrap();
+        map.insert(handle, Arc::downgrade(self));
+        handle
+    }
+
+    /// Imports a signal from an IPC handle.
+    ///
+    /// Checks the global IPC map for an existing signal with the given handle.
+    /// Returns `Some(Arc<Signal>)` if found and alive, `None` otherwise.
+    pub fn import_ipc(handle: u64) -> Option<Arc<Self>> {
+        let map = get_ipc_map().read().unwrap();
+        map.get(&handle).and_then(|weak| weak.upgrade())
     }
 
     pub fn value_gpu_address(&self) -> u64 {
@@ -902,6 +932,12 @@ impl Signal {
 
 impl Drop for Signal {
     fn drop(&mut self) {
+        if let Some(map_lock) = IPC_MAP.get() {
+            if let Ok(mut map) = map_lock.write() {
+                map.remove(&self.signal_handle_gpu_va());
+            }
+        }
+
         unsafe {
             (*self.ptr).core_signal = 0;
 
