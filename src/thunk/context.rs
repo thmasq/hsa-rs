@@ -41,6 +41,9 @@ pub struct Context {
     pub system_properties: HsaSystemProperties,
     /// A consolidated list of all initialized nodes.
     pub nodes: Vec<Node>,
+    /// Whether the underlying KFD driver supports reliable event age tracking.
+    /// This prevents race conditions where a signal is set before the waiter sleeps.
+    pub supports_event_age: bool,
 }
 
 // ===============================================================================================
@@ -66,6 +69,9 @@ pub fn acquire() -> io::Result<Arc<Context>> {
     }
 
     let kfd_device = KfdDevice::open()?;
+
+    let version = kfd_device.get_version().unwrap_or_default();
+    let supports_event_age = version.major_version == 1 && version.minor_version >= 14;
 
     let system_props = acquire_system_properties()?;
 
@@ -98,6 +104,7 @@ pub fn acquire() -> io::Result<Arc<Context>> {
         device: Arc::new(kfd_device),
         system_properties: system_props,
         nodes,
+        supports_event_age,
     });
 
     *guard = Some(context.clone());

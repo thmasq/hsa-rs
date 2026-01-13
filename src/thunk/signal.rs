@@ -1,6 +1,8 @@
 use crate::error::HsaResult;
 use crate::kfd::device::KfdDevice;
-use crate::thunk::events::{EventManager, HsaEvent, HsaEventDescriptor, HsaEventType, HsaSyncVar};
+use crate::thunk::events::{
+    EventManager, HsaEvent, HsaEventDataPayload, HsaEventDescriptor, HsaEventType, HsaSyncVar,
+};
 use crate::thunk::memory::{Allocation, MemoryManager};
 use crate::thunk::topology;
 use std::collections::HashMap;
@@ -784,10 +786,14 @@ impl Signal {
         condition: HsaSignalCondition,
         compare_value: i64,
         timeout_hint_clocks: u64,
-        wait_hint: HsaWaitState,
+        mut wait_hint: HsaWaitState,
         device: &KfdDevice,
         event_manager: &EventManager,
     ) -> i64 {
+        let supports_event_age = crate::thunk::context::acquire()
+            .map(|c| c.supports_event_age)
+            .unwrap_or(false);
+
         let frequency = topology::acquire_system_properties()
             .map(|props| props.timestamp_frequency)
             .unwrap_or(1_000_000_000);
@@ -817,7 +823,11 @@ impl Signal {
             };
         }
 
-        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let prev_waiters = self.waiting.fetch_add(1, Ordering::Relaxed);
+
+        if !supports_event_age && prev_waiters > 0 {
+            wait_hint = HsaWaitState::Active;
+        }
 
         std::sync::atomic::fence(Ordering::SeqCst);
 
@@ -854,8 +864,23 @@ impl Signal {
                         };
 
                         let events = vec![self.event.as_ref()];
-                        let _ =
-                            event_manager.wait_on_multiple_events(device, &events, false, wait_ms);
+                        if event_manager
+                            .wait_on_multiple_events(device, &events, false, wait_ms)
+                            .is_err()
+                        {
+                            return val;
+                        }
+
+                        if let Ok(payload) = self.event.payload.try_lock() {
+                            if matches!(
+                                *payload,
+                                HsaEventDataPayload::MemoryAccessFault(_)
+                                    | HsaEventDataPayload::HwException(_)
+                            ) {
+                                return val;
+                            }
+                        }
+
                         continue;
                     }
                 }
@@ -870,7 +895,23 @@ impl Signal {
                     let wait_ms = remaining.as_millis().min(u128::from(u32::MAX)) as u32;
 
                     let events = vec![self.event.as_ref()];
-                    let _ = event_manager.wait_on_multiple_events(device, &events, false, wait_ms);
+                    if event_manager
+                        .wait_on_multiple_events(device, &events, false, wait_ms)
+                        .is_err()
+                    {
+                        return val;
+                    }
+
+                    if let Ok(payload) = self.event.payload.try_lock() {
+                        if matches!(
+                            *payload,
+                            HsaEventDataPayload::MemoryAccessFault(_)
+                                | HsaEventDataPayload::HwException(_)
+                        ) {
+                            return val;
+                        }
+                    }
+
                     continue;
                 }
             }
@@ -1013,10 +1054,14 @@ fn wait_any_impl<const USE_TSC: bool>(
     conditions: &[HsaSignalCondition],
     values: &[i64],
     timeout_clocks: u64,
-    wait_hint: HsaWaitState,
+    mut wait_hint: HsaWaitState,
     device: &KfdDevice,
     event_manager: &EventManager,
 ) -> usize {
+    let supports_event_age = crate::thunk::context::acquire()
+        .map(|c| c.supports_event_age)
+        .unwrap_or(false);
+
     let frequency = topology::acquire_system_properties()
         .map(|props| props.timestamp_frequency)
         .unwrap_or(1_000_000_000);
@@ -1045,8 +1090,16 @@ fn wait_any_impl<const USE_TSC: bool>(
         };
     }
 
+    let mut has_contention = false;
     for s in signals {
-        s.waiting.fetch_add(1, Ordering::Relaxed);
+        let prev = s.waiting.fetch_add(1, Ordering::Relaxed);
+        if prev > 0 {
+            has_contention = true;
+        }
+    }
+
+    if !supports_event_age && has_contention {
+        wait_hint = HsaWaitState::Active;
     }
 
     std::sync::atomic::fence(Ordering::SeqCst);
@@ -1093,7 +1146,28 @@ fn wait_any_impl<const USE_TSC: bool>(
                         .min(u128::from(u32::MAX)) as u32
                 };
 
-                let _ = event_manager.wait_on_multiple_events(device, &events_ref, false, wait_ms);
+                let result =
+                    event_manager.wait_on_multiple_events(device, &events_ref, false, wait_ms);
+
+                if result.is_err() {
+                    return signals.len();
+                }
+
+                if let Ok(indices) = result {
+                    for &idx in &indices {
+                        if let Some(evt) = events_ref.get(idx) {
+                            if let Ok(payload) = evt.payload.try_lock() {
+                                if matches!(
+                                    *payload,
+                                    HsaEventDataPayload::MemoryAccessFault(_)
+                                        | HsaEventDataPayload::HwException(_)
+                                ) {
+                                    return signals.len();
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } else {
             let elapsed = inst_start.elapsed();
@@ -1111,7 +1185,27 @@ fn wait_any_impl<const USE_TSC: bool>(
                 .as_millis()
                 .min(u128::from(u32::MAX)) as u32;
 
-            let _ = event_manager.wait_on_multiple_events(device, &events_ref, false, wait_ms);
+            let result = event_manager.wait_on_multiple_events(device, &events_ref, false, wait_ms);
+
+            if result.is_err() {
+                return signals.len();
+            }
+
+            if let Ok(indices) = result {
+                for &idx in &indices {
+                    if let Some(evt) = events_ref.get(idx) {
+                        if let Ok(payload) = evt.payload.try_lock() {
+                            if matches!(
+                                *payload,
+                                HsaEventDataPayload::MemoryAccessFault(_)
+                                    | HsaEventDataPayload::HwException(_)
+                            ) {
+                                return signals.len();
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
