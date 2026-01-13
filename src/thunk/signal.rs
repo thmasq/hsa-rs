@@ -6,7 +6,7 @@ use crate::thunk::topology;
 use std::mem;
 use std::os::fd::RawFd;
 use std::ptr;
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -288,6 +288,10 @@ pub struct Signal {
     /// Tracks how many threads are currently waiting on this signal.
     /// Matches `waiting_` in `signal.h`.
     waiting: AtomicU32,
+
+    /// Tracks the agent associated with an asynchronous copy operation.
+    /// Used for resource accounting and identifying the copy path (SDMA vs Blit).
+    async_copy_agent: AtomicU64,
 }
 
 unsafe impl Send for Signal {}
@@ -336,6 +340,7 @@ impl Signal {
             pool,
             waiting: AtomicU32::new(0),
             gpu_base_va,
+            async_copy_agent: AtomicU64::new(0),
         };
 
         let signal_arc = Arc::new(signal);
@@ -364,6 +369,23 @@ impl Signal {
 
     pub fn signal_handle_gpu_va(&self) -> u64 {
         self.gpu_base_va
+    }
+
+    /// Sets the async copy agent and prepares the signal for profiling.
+    /// This corresponds to `Signal::async_copy_agent(core::Agent* agent)` in ROCm.
+    pub fn set_async_copy_agent(&self, agent_handle: u64) {
+        self.async_copy_agent.store(agent_handle, Ordering::Relaxed);
+        unsafe {
+            // This allows determining if the copy was performed via SDMA or Blit kernel
+            // by checking if these values remain 0 later.
+            (*self.ptr).sdma_start_ts = 0;
+            (*self.ptr).sdma_end_ts = 0;
+        }
+    }
+
+    /// Retrieves the async copy agent handle.
+    pub fn get_async_copy_agent(&self) -> u64 {
+        self.async_copy_agent.load(Ordering::Relaxed)
     }
 
     /// Internal helper to get the atomic reference.
