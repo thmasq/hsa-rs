@@ -47,6 +47,7 @@ pub struct HsaQueue {
     eop_mem: Option<Allocation>,
     cwsr_mem: Option<Allocation>,
     ptr_mem: Option<Allocation>,
+    _doorbell_mem: Option<Allocation>,
 }
 
 impl Drop for HsaQueue {
@@ -86,6 +87,7 @@ pub trait MemoryManager {
         vram: bool,
         public: bool,
         drm_fd: RawFd,
+        node_id: u32,
     ) -> HsaResult<Allocation>;
 
     /// Free allocated memory
@@ -99,7 +101,7 @@ pub trait MemoryManager {
         gpu_id: u32,
         doorbell_offset: u64,
         size: u64,
-    ) -> HsaResult<*mut u32>;
+    ) -> HsaResult<Allocation>;
 }
 
 pub struct QueueBuilder<'a> {
@@ -218,7 +220,8 @@ impl<'a> QueueBuilder<'a> {
             return Err(HsaError::from(e));
         }
 
-        let doorbell_ptr = self.resolve_doorbell_ptr(args.doorbell_offset, gfx_version)?;
+        let (doorbell_alloc, doorbell_ptr) =
+            self.resolve_doorbell_ptr(args.doorbell_offset, gfx_version)?;
 
         Ok(HsaQueue {
             queue_id: args.queue_id,
@@ -232,6 +235,7 @@ impl<'a> QueueBuilder<'a> {
             eop_mem,
             cwsr_mem,
             ptr_mem,
+            _doorbell_mem: Some(doorbell_alloc),
         })
     }
 
@@ -245,6 +249,7 @@ impl<'a> QueueBuilder<'a> {
                 true, // Try VRAM first
                 true,
                 self.drm_fd,
+                self.node_id,
             );
 
             if alloc_res.is_err() {
@@ -256,6 +261,7 @@ impl<'a> QueueBuilder<'a> {
                     false, // VRAM=false -> GTT
                     true,
                     self.drm_fd,
+                    self.node_id,
                 );
             }
 
@@ -290,6 +296,7 @@ impl<'a> QueueBuilder<'a> {
                     false,
                     false,
                     self.drm_fd,
+                    self.node_id,
                 )
                 .inspect_err(|_e| {
                     eprintln!("Failed to allocate CWSR");
@@ -307,7 +314,15 @@ impl<'a> QueueBuilder<'a> {
     fn alloc_pointers(&mut self) -> HsaResult<Allocation> {
         let ptr_alloc = self
             .mem_mgr
-            .allocate_gpu_memory(self.device, 4096, 4096, false, true, self.drm_fd)
+            .allocate_gpu_memory(
+                self.device,
+                4096,
+                4096,
+                false,
+                true,
+                self.drm_fd,
+                self.node_id,
+            )
             .inspect_err(|e| {
                 eprintln!("Failed to allocate queue pointers: {e:?}");
             })?;
@@ -352,7 +367,7 @@ impl<'a> QueueBuilder<'a> {
         &mut self,
         kernel_offset: u64,
         gfx_version: u32,
-    ) -> HsaResult<*mut u32> {
+    ) -> HsaResult<(Allocation, *mut u32)> {
         let is_soc15 = gfx_version >= 90000;
 
         let doorbell_page_size = if gfx_version >= 90000 { 8 } else { 4 } * 1024;
@@ -367,7 +382,7 @@ impl<'a> QueueBuilder<'a> {
 
         let ptr_offset = if is_soc15 { kernel_offset & mask } else { 0 };
 
-        let base_ptr = self.mem_mgr.map_doorbell(
+        let allocation = self.mem_mgr.map_doorbell(
             self.device,
             self.node_id,
             self.node_props.kfd_gpu_id,
@@ -379,8 +394,9 @@ impl<'a> QueueBuilder<'a> {
         // The Kernel ensures `kernel_offset` corresponds to a valid 4-byte aligned doorbell register.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
-            let byte_ptr = base_ptr.cast::<u8>().add(ptr_offset as usize);
-            Ok(byte_ptr.cast::<u32>())
+            // Calculate the specific u32 pointer from the allocation's base ptr
+            let byte_ptr = allocation.as_mut_ptr().add(ptr_offset as usize);
+            Ok((allocation, byte_ptr.cast::<u32>()))
         }
     }
 }

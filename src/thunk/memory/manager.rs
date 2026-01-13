@@ -21,7 +21,6 @@ use crate::thunk::memory::aperture::Aperture;
 use crate::thunk::memory::{Allocation, ApertureAllocator, ArcManager};
 use crate::thunk::queues::builder::MemoryManager as BuilderMemoryManager;
 use std::collections::HashMap;
-use std::mem;
 use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
@@ -495,12 +494,7 @@ impl MemoryManager {
         gpu_id: u32,
         doorbell_offset: u64,
         size: u64,
-    ) -> HsaResult<*mut u32> {
-        // Doorbell allocation is specialized and requires mapping a specific physical
-        // offset provided by the Queue creation (doorbell_offset), unlike standard
-        // allocation which asks KFD to pick an offset.
-        // Therefore, we cannot easily delegate to `self.allocate` because of the mmap arguments.
-
+    ) -> HsaResult<Allocation> {
         let size = size as usize;
         let flags = AllocFlags::new().doorbell();
 
@@ -545,7 +539,7 @@ impl MemoryManager {
                 self.svm_alt_aperture.free_va(va_addr, size);
                 return Err(HsaError::General("mmap failed for doorbell".into()));
             }
-            cpu_ptr = ret.cast::<u32>();
+            cpu_ptr = ret.cast::<u8>();
         }
 
         let manager_handle = self
@@ -554,8 +548,8 @@ impl MemoryManager {
             .and_then(std::sync::Weak::upgrade)
             .ok_or_else(|| HsaError::General("MemoryManager has been dropped".into()))?;
 
-        let allocation = Allocation {
-            ptr: cpu_ptr.cast::<u8>(),
+        Ok(Allocation {
+            ptr: cpu_ptr,
             size,
             gpu_va: va_addr,
             handle: args.handle,
@@ -564,14 +558,7 @@ impl MemoryManager {
             flags,
             device: device.clone(),
             manager_handle,
-        };
-
-        // We intentionally forget the RAII object because we are returning a raw pointer
-        // to the user, and they expect this mapping to persist for the lifetime of the Queue.
-        // If we didn't forget, `allocation` would drop here, immediately unmapping the doorbell.
-        mem::forget(allocation);
-
-        Ok(cpu_ptr)
+        })
     }
 
     /// Internal helper: reclaim VA space.
@@ -602,6 +589,7 @@ impl BuilderMemoryManager for MemoryManager {
         vram: bool,
         public: bool,
         drm_fd: RawFd,
+        node_id: u32,
     ) -> HsaResult<Allocation> {
         let mut flags = AllocFlags::new();
         if vram {
@@ -618,7 +606,7 @@ impl BuilderMemoryManager for MemoryManager {
 
         flags = flags.executable().coherent();
 
-        self.allocate(device, size, align, flags, None, drm_fd)
+        self.allocate(device, size, align, flags, Some(node_id), drm_fd)
     }
 
     fn free_gpu_memory(&mut self, _device: &KfdDevice, _alloc: &Allocation) {
@@ -633,7 +621,7 @@ impl BuilderMemoryManager for MemoryManager {
         gpu_id: u32,
         doorbell_offset: u64,
         size: u64,
-    ) -> HsaResult<*mut u32> {
+    ) -> HsaResult<Allocation> {
         self.map_doorbell(device, node_id, gpu_id, doorbell_offset, size)
     }
 }

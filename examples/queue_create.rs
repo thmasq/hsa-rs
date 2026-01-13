@@ -71,8 +71,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ring_size = 64 * 1024;
     println!("[+] Allocating {} KB Ring Buffer...", ring_size / 1024);
 
-    // [FIX 1] Removed extra argument `mem_mgr_arc.clone()`
-    // [FIX 2] Scoped the lock so `guard` is dropped immediately after allocation.
     let ring_mem = {
         let mut guard = mem_mgr_arc.lock().unwrap();
         guard
@@ -86,9 +84,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 6. Build the Queue
     println!("[+] creating Compute Queue...");
 
-    // [FIX 3] Scoped the lock again.
-    // We hold the lock ONLY while the builder is creating the queue.
-    // Once `queue` is returned, `guard` is dropped, releasing the lock.
     let queue = {
         let mut guard = mem_mgr_arc.lock().unwrap();
 
