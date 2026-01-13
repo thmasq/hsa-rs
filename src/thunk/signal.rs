@@ -183,7 +183,7 @@ const _: () = assert!(mem::offset_of!(SharedSignal, sdma_start_ts) == 64);
 #[derive(Debug)]
 pub struct SignalPool {
     /// Pointers to available 128-byte `SharedSignal` slots.
-    free_list: Vec<*mut SharedSignal>,
+    free_list: Vec<(*mut SharedSignal, u64)>,
     /// Underlying GTT allocations.
     block_list: Vec<Allocation>,
     /// Number of signals to allocate in the next block.
@@ -221,21 +221,28 @@ impl SignalPool {
         mem_manager: &mut MemoryManager,
         node_id: u32,
         drm_fd: RawFd,
-    ) -> HsaResult<*mut SharedSignal> {
+    ) -> HsaResult<(*mut SharedSignal, u64)> {
         if self.free_list.is_empty() {
             let num_signals = self.next_block_signals;
             let block_bytes = num_signals * std::mem::size_of::<SharedSignal>();
 
             let allocation = mem_manager.allocate_gtt(device, block_bytes, node_id, drm_fd)?;
             let base_ptr = allocation.as_mut_ptr().cast::<SharedSignal>();
+            let base_gpu_va = allocation.gpu_va;
 
             for i in 0..num_signals {
                 unsafe {
                     let slot_ptr = base_ptr.add(i);
+                    // Calculate the specific GPU VA for this slot
+                    let slot_gpu_va =
+                        base_gpu_va + (i * std::mem::size_of::<SharedSignal>()) as u64;
+
                     std::ptr::write_bytes(slot_ptr, 0, 1);
                     (*slot_ptr).amd_signal.kind = AmdSignalKind::Invalid as i64;
                     (*slot_ptr).id = 0x71FC_CA6A_3D5D_5276;
-                    self.free_list.push(slot_ptr);
+
+                    // Push the tuple (ptr, va) to the free list
+                    self.free_list.push((slot_ptr, slot_gpu_va));
                 }
             }
 
@@ -243,15 +250,16 @@ impl SignalPool {
             self.next_block_signals = (num_signals * 2).min(Self::MAX_BLOCK_SIGNALS);
         }
 
+        // Now pop returns the tuple matching the return type
         Ok(self.free_list.pop().expect("Pool must have free slots"))
     }
 
     /// Returns a slot to the pool for reuse.
-    pub unsafe fn free(&mut self, ptr: *mut SharedSignal) {
+    pub unsafe fn free(&mut self, ptr: *mut SharedSignal, gpu_va: u64) {
         unsafe {
             // Mark kind as invalid so any late GPU/CPU access is recognizable.
             (*ptr).amd_signal.kind = AmdSignalKind::Invalid as i64;
-            self.free_list.push(ptr);
+            self.free_list.push((ptr, gpu_va));
         }
     }
 }
@@ -265,6 +273,9 @@ pub struct Signal {
     /// Pointer to the ABI block.
     /// This points into the memory buffer held by `_allocation`.
     ptr: *mut SharedSignal,
+
+    /// Pointer to base address of a signal
+    gpu_base_va: u64,
 
     /// The backing KFD event used for sleeping waits.
     /// We keep an Arc to share it with wait lists.
@@ -300,11 +311,11 @@ impl Signal {
         pool: Arc<Mutex<SignalPool>>,
         drm_fd: RawFd,
         node_id: u32,
-    ) -> HsaResult<Self> {
-        let ptr = pool
-            .lock()
-            .unwrap()
-            .alloc(device, mem_manager, node_id, drm_fd)?;
+    ) -> HsaResult<Arc<Self>> {
+        let (ptr, gpu_base_va) =
+            pool.lock()
+                .unwrap()
+                .alloc(device, mem_manager, node_id, drm_fd)?;
 
         let event_desc = HsaEventDescriptor {
             event_type: HsaEventType::Signal,
@@ -319,21 +330,40 @@ impl Signal {
             event_manager.create_event(device, mem_manager, drm_fd, &event_desc, true, false)?;
         let event = Arc::new(event);
 
-        unsafe {
-            let signal = &mut (*ptr).amd_signal;
-            signal.kind = AmdSignalKind::User as i64;
-            signal.value.store(initial_value, Ordering::Relaxed);
-
-            signal.event_id = event.event_id;
-            signal.event_mailbox_ptr = event.hw_data2;
-        }
-
-        Ok(Self {
+        let signal = Self {
             ptr,
-            event,
+            event: event.clone(),
             pool,
             waiting: AtomicU32::new(0),
-        })
+            gpu_base_va,
+        };
+
+        let signal_arc = Arc::new(signal);
+
+        unsafe {
+            let shared = &mut (*ptr);
+
+            shared.amd_signal.kind = AmdSignalKind::User as i64;
+            shared
+                .amd_signal
+                .value
+                .store(initial_value, Ordering::Relaxed);
+            shared.amd_signal.event_id = event.event_id;
+            shared.amd_signal.event_mailbox_ptr = event.hw_data2;
+
+            let signal_stable_ptr = Arc::as_ptr(&signal_arc) as u64;
+            shared.core_signal = signal_stable_ptr;
+        }
+
+        Ok(signal_arc)
+    }
+
+    pub fn value_gpu_address(&self) -> u64 {
+        self.gpu_base_va + 8
+    }
+
+    pub fn signal_handle_gpu_va(&self) -> u64 {
+        self.gpu_base_va
     }
 
     /// Internal helper to get the atomic reference.
@@ -782,7 +812,14 @@ impl Signal {
 
 impl Drop for Signal {
     fn drop(&mut self) {
-        unsafe { self.pool.lock().expect("Poisoned pool").free(self.ptr) };
+        unsafe {
+            (*self.ptr).core_signal = 0;
+
+            self.pool
+                .lock()
+                .expect("Poisoned pool")
+                .free(self.ptr, self.gpu_base_va)
+        };
     }
 }
 

@@ -50,6 +50,16 @@ pub struct HsaQueue {
     _doorbell_mem: Option<Allocation>,
 }
 
+impl HsaQueue {
+    /// Returns the CPU pointer to the Queue Write Index.
+    /// The Write Index is at offset 8 in the ptr_mem allocation.
+    pub fn write_ptr_cpu_addr(&self) -> Option<*mut u64> {
+        self.ptr_mem
+            .as_ref()
+            .map(|alloc| unsafe { alloc.ptr.add(8).cast::<u64>() })
+    }
+}
+
 impl Drop for HsaQueue {
     fn drop(&mut self) {
         if let Err(e) = self.device.destroy_queue(self.queue_id) {
@@ -118,6 +128,7 @@ pub struct QueueBuilder<'a> {
     ring_base: u64,
     ring_size: u64,
     sdma_engine_id: u32,
+    user_cwsr: Option<(u64, u32, u32)>, // (address, size, ctl_stack_size)
 }
 
 impl<'a> QueueBuilder<'a> {
@@ -142,6 +153,7 @@ impl<'a> QueueBuilder<'a> {
             percentage: 100,
             priority: QueuePriority::Normal,
             sdma_engine_id: 0,
+            user_cwsr: None,
         }
     }
 
@@ -154,6 +166,21 @@ impl<'a> QueueBuilder<'a> {
     #[must_use]
     pub const fn with_priority(mut self, p: QueuePriority) -> Self {
         self.priority = p;
+        self
+    }
+
+    /// Manually specify the Context Save/Restore area.
+    ///
+    /// This is required for creating AQL queues if the library's automatic allocation
+    /// is insufficient or if you need to control the backing memory.
+    ///
+    /// # Arguments
+    /// * `address` - GPU Virtual Address of the CWSR area (must be 4KB aligned)
+    /// * `size` - Total size of the CWSR area
+    /// * `ctl_stack_size` - Size of the Control Stack portion (usually 0xA000 - 0x10000 depending on ASIC)
+    #[must_use]
+    pub fn with_cwsr(mut self, address: u64, size: u32, ctl_stack_size: u32) -> Self {
+        self.user_cwsr = Some((address, size, ctl_stack_size));
         self
     }
 
@@ -172,7 +199,11 @@ impl<'a> QueueBuilder<'a> {
 
         let eop_mem = self.alloc_eop(gfx_version, is_compute)?;
 
-        let (cwsr_mem, cwsr_sizes) = self.alloc_cwsr(gfx_version, is_compute)?;
+        let (cwsr_mem, cwsr_sizes) = if self.user_cwsr.is_some() {
+            (None, None)
+        } else {
+            self.alloc_cwsr(gfx_version, is_compute)?
+        };
 
         let ptr_mem = self.alloc_pointers()?;
 
@@ -196,19 +227,19 @@ impl<'a> QueueBuilder<'a> {
             ..Default::default()
         };
 
-        if self.queue_type == QueueType::ComputeAql {
-            args.read_pointer_address = 0;
-            args.write_pointer_address = 0;
-        } else {
-            args.read_pointer_address = rptr_va;
-            args.write_pointer_address = wptr_va;
-        }
+        args.read_pointer_address = rptr_va;
+        args.write_pointer_address = wptr_va;
 
         if let Some(eop) = &eop_mem {
             args.eop_buffer_address = eop.gpu_va;
             args.eop_buffer_size = eop.size as u64;
         }
-        if let Some(cwsr) = &cwsr_mem {
+
+        if let Some((addr, size, ctl_size)) = self.user_cwsr {
+            args.ctx_save_restore_address = addr;
+            args.ctx_save_restore_size = size;
+            args.ctl_stack_size = ctl_size;
+        } else if let Some(cwsr) = &cwsr_mem {
             let sizes = cwsr_sizes.as_ref().unwrap();
             args.ctx_save_restore_address = cwsr.gpu_va;
             args.ctx_save_restore_size = sizes.ctx_save_restore_size;

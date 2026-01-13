@@ -457,7 +457,11 @@ impl MemoryManager {
         node_id: u32,
         drm_fd: RawFd,
     ) -> HsaResult<Allocation> {
-        let flags = AllocFlags::new().vram().executable().no_substitute();
+        let flags = AllocFlags::new()
+            .vram()
+            .executable()
+            .no_substitute()
+            .host_access();
 
         self.allocate(device, size, align, flags, Some(node_id), drm_fd)
     }
