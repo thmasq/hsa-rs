@@ -1209,3 +1209,244 @@ fn wait_any_impl<const USE_TSC: bool>(
         }
     }
 }
+
+/// Waits for all of the provided signals to satisfy their conditions.
+pub fn wait_all(
+    signals: &[&Signal],
+    conditions: &[HsaSignalCondition],
+    values: &[i64],
+    timeout_clocks: u64,
+    wait_hint: HsaWaitState,
+    device: &KfdDevice,
+    event_manager: &EventManager,
+) -> bool {
+    assert_eq!(signals.len(), conditions.len());
+    assert_eq!(signals.len(), values.len());
+
+    if signals.len() == 1 {
+        let val = signals[0].wait_relaxed(
+            conditions[0],
+            values[0],
+            timeout_clocks,
+            wait_hint,
+            device,
+            event_manager,
+        );
+        return check_condition(val, conditions[0], values[0]);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let use_tsc = x86_utils::is_tsc_safe();
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let use_tsc = false;
+
+    if use_tsc {
+        wait_all_impl::<true>(
+            signals,
+            conditions,
+            values,
+            timeout_clocks,
+            wait_hint,
+            device,
+            event_manager,
+        )
+    } else {
+        wait_all_impl::<false>(
+            signals,
+            conditions,
+            values,
+            timeout_clocks,
+            wait_hint,
+            device,
+            event_manager,
+        )
+    }
+}
+
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn wait_all_impl<const USE_TSC: bool>(
+    signals: &[&Signal],
+    conditions: &[HsaSignalCondition],
+    values: &[i64],
+    timeout_clocks: u64,
+    mut wait_hint: HsaWaitState,
+    device: &KfdDevice,
+    event_manager: &EventManager,
+) -> bool {
+    let supports_event_age = crate::thunk::context::acquire()
+        .map(|c| c.supports_event_age)
+        .unwrap_or(false);
+
+    let frequency = topology::acquire_system_properties()
+        .map(|props| props.timestamp_frequency)
+        .unwrap_or(1_000_000_000);
+
+    let mut tsc_start = 0u64;
+    let mut tsc_spin_cycles = 0u64;
+
+    let mut inst_start = Instant::now();
+    let mut inst_spin_dur = Duration::ZERO;
+    let mut inst_timeout = Duration::ZERO;
+
+    if USE_TSC {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        unsafe {
+            tsc_start = x86_utils::rdtsc();
+            tsc_spin_cycles = (200 * frequency) / 1_000_000; // 200us
+        }
+    } else {
+        inst_start = Instant::now();
+        inst_spin_dur = Duration::from_micros(200);
+        inst_timeout = if timeout_clocks == u64::MAX {
+            Duration::from_secs(31_536_000)
+        } else {
+            let nanos = (u128::from(timeout_clocks) * 1_000_000_000) / u128::from(frequency);
+            Duration::from_nanos(nanos as u64)
+        };
+    }
+
+    let mut has_contention = false;
+    for s in signals {
+        let prev = s.waiting.fetch_add(1, Ordering::Relaxed);
+        if prev > 0 {
+            has_contention = true;
+        }
+    }
+
+    if !supports_event_age && has_contention {
+        wait_hint = HsaWaitState::Active;
+    }
+
+    std::sync::atomic::fence(Ordering::SeqCst);
+
+    let _guard = GroupWaitGuard(signals);
+
+    let mut satisfied = vec![false; signals.len()];
+    let mut satisfied_count = 0;
+
+    loop {
+        for (i, signal) in signals.iter().enumerate() {
+            if !satisfied[i] {
+                let val = signal.load_relaxed();
+                if check_condition(val, conditions[i], values[i]) {
+                    satisfied[i] = true;
+                    satisfied_count += 1;
+                }
+            }
+        }
+
+        if satisfied_count == signals.len() {
+            return true;
+        }
+
+        if USE_TSC {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            unsafe {
+                let now = x86_utils::rdtsc();
+                let elapsed = now.wrapping_sub(tsc_start);
+
+                if timeout_clocks != u64::MAX && elapsed >= timeout_clocks {
+                    return false;
+                }
+
+                if wait_hint == HsaWaitState::Active || elapsed < tsc_spin_cycles {
+                    std::hint::spin_loop();
+                    continue;
+                }
+
+                let remaining_cycles = if timeout_clocks == u64::MAX {
+                    u64::MAX
+                } else {
+                    timeout_clocks - elapsed
+                };
+
+                let wait_ms = if remaining_cycles == u64::MAX {
+                    u32::MAX
+                } else {
+                    ((u128::from(remaining_cycles) * 1000) / u128::from(frequency))
+                        .min(u128::from(u32::MAX)) as u32
+                };
+
+                let mut events_ref = Vec::with_capacity(signals.len() - satisfied_count);
+                for (i, s) in signals.iter().enumerate() {
+                    if !satisfied[i] {
+                        events_ref.push(s.event.as_ref());
+                    }
+                }
+
+                events_ref.sort_by_key(|e| e.event_id);
+                events_ref.dedup_by_key(|e| e.event_id);
+
+                let result =
+                    event_manager.wait_on_multiple_events(device, &events_ref, true, wait_ms);
+
+                if result.is_err() {
+                    return false;
+                }
+
+                if let Ok(indices) = result {
+                    for &idx in &indices {
+                        if let Some(evt) = events_ref.get(idx) {
+                            if let Ok(payload) = evt.payload.try_lock() {
+                                if matches!(
+                                    *payload,
+                                    HsaEventDataPayload::MemoryAccessFault(_)
+                                        | HsaEventDataPayload::HwException(_)
+                                ) {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            let elapsed = inst_start.elapsed();
+            if elapsed > inst_timeout {
+                return false;
+            }
+
+            if wait_hint == HsaWaitState::Active || elapsed < inst_spin_dur {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            let wait_ms = inst_timeout
+                .saturating_sub(elapsed)
+                .as_millis()
+                .min(u128::from(u32::MAX)) as u32;
+
+            let mut events_ref = Vec::with_capacity(signals.len() - satisfied_count);
+            for (i, s) in signals.iter().enumerate() {
+                if !satisfied[i] {
+                    events_ref.push(s.event.as_ref());
+                }
+            }
+            events_ref.sort_by_key(|e| e.event_id);
+            events_ref.dedup_by_key(|e| e.event_id);
+
+            let result = event_manager.wait_on_multiple_events(device, &events_ref, true, wait_ms);
+
+            if result.is_err() {
+                return false;
+            }
+
+            if let Ok(indices) = result {
+                for &idx in &indices {
+                    if let Some(evt) = events_ref.get(idx) {
+                        if let Ok(payload) = evt.payload.try_lock() {
+                            if matches!(
+                                *payload,
+                                HsaEventDataPayload::MemoryAccessFault(_)
+                                    | HsaEventDataPayload::HwException(_)
+                            ) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
