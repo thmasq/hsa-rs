@@ -143,6 +143,7 @@ const fn check_condition(value: i64, condition: HsaSignalCondition, compare_valu
 
 #[allow(dead_code)]
 #[repr(i64)]
+#[derive(Debug, Copy, Clone)]
 enum AmdSignalKind {
     Invalid = 0,
     User = 1,
@@ -316,6 +317,72 @@ impl Signal {
         drm_fd: RawFd,
         node_id: u32,
     ) -> HsaResult<Arc<Self>> {
+        Self::create_internal(
+            initial_value,
+            device,
+            event_manager,
+            mem_manager,
+            pool,
+            drm_fd,
+            node_id,
+            AmdSignalKind::User,
+            0,
+        )
+    }
+
+    /// Creates a new Doorbell Signal specifically mapped for hardware queues.
+    ///
+    /// # Arguments
+    /// * `initial_value` - The starting value.
+    /// * `device` - The KFD device.
+    /// * `event_manager` - The event manager instance.
+    /// * `mem_manager` - Memory manager.
+    /// * `pool` - Signal pool.
+    /// * `drm_fd` - DRM file descriptor.
+    /// * `node_id` - Topology node ID.
+    /// * `queue_ptr` - Pointer to the AQL queue this doorbell belongs to.
+    /// * `is_legacy` - If true, creates a `LegacyDoorbell` signal; otherwise `Doorbell`.
+    pub fn new_doorbell(
+        initial_value: HsaSignalValue,
+        device: &KfdDevice,
+        event_manager: &mut EventManager,
+        mem_manager: &mut MemoryManager,
+        pool: Arc<Mutex<SignalPool>>,
+        drm_fd: RawFd,
+        node_id: u32,
+        queue_ptr: u64,
+        is_legacy: bool,
+    ) -> HsaResult<Arc<Self>> {
+        let kind = if is_legacy {
+            AmdSignalKind::LegacyDoorbell
+        } else {
+            AmdSignalKind::Doorbell
+        };
+        Self::create_internal(
+            initial_value,
+            device,
+            event_manager,
+            mem_manager,
+            pool,
+            drm_fd,
+            node_id,
+            kind,
+            queue_ptr,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_internal(
+        initial_value: HsaSignalValue,
+        device: &KfdDevice,
+        event_manager: &mut EventManager,
+        mem_manager: &mut MemoryManager,
+        pool: Arc<Mutex<SignalPool>>,
+        drm_fd: RawFd,
+        node_id: u32,
+        kind: AmdSignalKind,
+        queue_ptr: u64,
+    ) -> HsaResult<Arc<Self>> {
         let (ptr, gpu_base_va) =
             pool.lock()
                 .unwrap()
@@ -348,13 +415,14 @@ impl Signal {
         unsafe {
             let shared = &mut (*ptr);
 
-            shared.amd_signal.kind = AmdSignalKind::User as i64;
+            shared.amd_signal.kind = kind as i64;
             shared
                 .amd_signal
                 .value
                 .store(initial_value, Ordering::Relaxed);
             shared.amd_signal.event_id = event.event_id;
             shared.amd_signal.event_mailbox_ptr = event.hw_data2;
+            shared.amd_signal.queue_ptr = queue_ptr;
 
             let signal_stable_ptr = Arc::as_ptr(&signal_arc) as u64;
             shared.core_signal = signal_stable_ptr;
